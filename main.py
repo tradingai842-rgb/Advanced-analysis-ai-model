@@ -1597,4 +1597,4 @@ class XAUUSDBot:
             keyboard = [
                 [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
                 [InlineKeyboardButton("📊 Structure", callback_data="structure")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="back")
+                [InlineKeyboardButton("⬅️ Back", callback_data="back")]
