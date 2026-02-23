@@ -1593,8 +1593,11 @@ class XAUUSDBot:
                 f"Delta: {signal.context['delta_bias'].upper()}\n"
                 f"SMC Pressure: {signal.context['smart_money_pressure']:+.2f}"
             )
-            
             keyboard = [
-                [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-                [InlineKeyboardButton("📊 Structure", callback_data="structure")],
-                [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+    [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+    [InlineKeyboardButton("📊 Structure", callback_data="structure")],
+    [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+]
+
+reply_markup = InlineKeyboardMarkup(keyboard)
+            
