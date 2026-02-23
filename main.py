@@ -1592,12 +1592,14 @@ class XAUUSDBot:
                 f"Vol: {signal.context['volatility'].upper()}\n"
                 f"Delta: {signal.context['delta_bias'].upper()}\n"
                 f"SMC Pressure: {signal.context['smart_money_pressure']:+.2f}"
-            )
-            keyboard = [
+
+keyboard = [
     [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
     [InlineKeyboardButton("📊 Structure", callback_data="structure")],
     [InlineKeyboardButton("⬅️ Back", callback_data="back")]
 ]
 
 reply_markup = InlineKeyboardMarkup(keyboard)
+
+await update.message.reply_text(text_message, reply_markup=reply_markup)
             
