@@ -1584,14 +1584,15 @@ class XAUUSDBot:
             for i, reason in enumerate(signal.reasons[:8], 1):
                 message += f"{i}. {reason}\n"
             
-            message += (
-                f"\n*Context:*\n"
-                f"Structure: {signal.context['structure'].upper()}\n"
-                f"Trend: {signal.context['trend_strength']}/1.0\n"
-                f"Session: {signal.context['session'].upper()}\n"
-                f"Vol: {signal.context['volatility'].upper()}\n"
-                f"Delta: {signal.context['delta_bias'].upper()}\n"
-                f"SMC Pressure: {signal.context['smart_money_pressure']:+.2f}"
+            message += f"""
+*Context:*
+Structure: {signal.context['structure'].upper()}
+Trend: {signal.context['trend_strength']}/1.0
+Session: {signal.context['session'].upper()}
+Vol: {signal.context['volatility'].upper()}
+Delta: {signal.context['delta_bias'].upper()}
+SMC Pressure: {signal.context['smart_money_pressure']:+.2f}
+"""
 
 keyboard = [
     [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
