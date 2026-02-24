@@ -1505,114 +1505,239 @@ class XAUUSDBot:
         await query.answer()
         
         if query.data == "analyze":
-            await self._run_full_analysis(query)
-        elif query.data == "structure":
-            await self._show_structure(query)
-        elif query.data == "orderflow":
-            await self._show_orderflow(query)
-        elif query.data == "ml":
-            await self._show_ml_prediction(query)
-        elif query.data == "settings":
-            await self._show_settings(query)
-        elif query.data == "back":
-            await self.start(update, context)
-    
-    async def _run_full_analysis(self, query):
-        await query.edit_message_text("🔬 Running maximum analysis across all modules...")
-        
-        try:
-            async with self.data_client as client:
-                df_1m = await client.get_ohlcv("XAU/USD", "1min", outputsize=500)
-                df_5m = await client.get_ohlcv("XAU/USD", "5min", outputsize=500)
-                df_15m = await client.get_ohlcv("XAU/USD", "15min", outputsize=300)
-                df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=200)
-            
-            news_task = self.news_filter.get_trading_conditions()
-            alt_task = self._get_alternative_data()
-            
-            news_context, alt_data = await asyncio.gather(news_task, alt_task)
-            
-            if news_context["recommendation"] == "WAIT":
-                await query.edit_message_text(
-                    f"⛔ *TRADING HALTED - NEWS FILTER*\n\n"
-                    f"Impact Score: {news_context['impact_score']:.2f}/1.0\n"
-                    f"Categories: {', '.join(news_context['categories'])}\n"
-                    f"GeoPolitical Risk: {news_context['geopolitical_risk']:.2f}\n"
-                    f"Sentiment: {news_context['sentiment']:+.2f}\n\n"
-                    f"Capital protection active.",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
-                )
-                return
-            
-            signal = await self.engine.analyze(df_1m, df_5m, df_15m, df_1h, news_context, alt_data)
-            
-            if signal is None:
-                await query.edit_message_text(
-                    "⚪ *NO HIGH-PROBABILITY SETUP*\n\n"
-                    f"Confidence threshold: 80%\n"
-                    f"Current market: {self.engine.smc.market_structure.value}\n"
-                    f"Anomaly score: {self.engine.anomaly.baseline_std if self.engine.anomaly.baseline_std else 'N/A'}\n\n"
-                    "Waiting for institutional confluence...",
-                    parse_mode="Markdown",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔄 Refresh", callback_data="analyze")],
-                        [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-                    ])
-                )
-                return
-            
-            self.last_signal = signal
-            
-            emoji = "🟢" if signal.direction == "LONG" else "🔴"
-            direction_text = f"{emoji} *{signal.direction}* {emoji}"
-            
-            message = (
-                f"{direction_text}\n\n"
-                f"📍 Entry: `{signal.entry}`\n"
-                f"🛑 Stop: `{signal.stop_loss}`\n"
-                f"🎯 TP1: `{signal.take_profit_1}` (1:{signal.risk_reward_1})\n"
-                f"🎯 TP2: `{signal.take_profit_2}` (1:{signal.risk_reward_2})\n\n"
-                f"🎯 Confidence: *{signal.confidence}%*\n"
-                f"📊 Position: {signal.position_size*100:.2f}%\n"
-                f"⚠️ Slippage: ±{signal.expected_slippage*100:.2f}%\n\n"
-                f"*ML Prediction:* {signal.ml_prediction:+.4f}\n"
-                f"*Anomaly Score:* {signal.anomaly_score:.2f}\n\n"
-                f"*Confluence ({len(signal.reasons)} factors):*\n"
+    await self._run_full_analysis(query)
+elif query.data == "structure":
+    await self._show_structure(query)
+elif query.data == "orderflow":
+    await self._show_orderflow(query)
+elif query.data == "ml":
+    await self._show_ml_prediction(query)
+elif query.data == "settings":
+    await self._show_settings(query)
+elif query.data == "back":
+    await self.start(update, context)
+
+async def _run_full_analysis(self, query):
+    await query.edit_message_text("🔬 Running maximum analysis across all modules...")
+
+    try:
+        async with self.data_client as client:
+            df_1m = await client.get_ohlcv("XAU/USD", "1min", outputsize=500)
+            df_5m = await client.get_ohlcv("XAU/USD", "5min", outputsize=500)
+            df_15m = await client.get_ohlcv("XAU/USD", "15min", outputsize=300)
+            df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=200)
+
+        news_task = self.news_filter.get_trading_conditions()
+        alt_task = self._get_alternative_data()
+
+        news_context, alt_data = await asyncio.gather(news_task, alt_task)
+
+        if news_context["recommendation"] == "WAIT":
+            await query.edit_message_text(
+                f"⛔ *TRADING HALTED - NEWS FILTER*\n\n"
+                f"Impact Score: {news_context['impact_score']:.2f}/1.0\n"
+                f"Categories: {', '.join(news_context['categories'])}\n"
+                f"GeoPolitical Risk: {news_context['geopolitical_risk']:.2f}\n"
+                f"Sentiment: {news_context['sentiment']:+.2f}\n\n"
+                f"Capital protection active.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
             )
-            
-           for i, reason in enumerate(signal.reasons[:8], 1):
-        message += f"{i}. {reason}\n"
+            return
 
-    context = signal.context
+        signal = await self.engine.analyze(df_1m, df_5m, df_15m, df_1h, news_context, alt_data)
 
-    structure = context.get("structure", "N/A")
-    trend = context.get("trend_strength", "N/A")
-    session = context.get("session", "N/A")
-    vol = context.get("volatility", "N/A")
-    delta = context.get("delta_bias", "N/A")
-    smc_pressure = context.get("smart_money_pressure", 0.0)
+        if signal is None:
+            await query.edit_message_text(
+                "⚪ *NO HIGH-PROBABILITY SETUP*\n\n"
+                f"Confidence threshold: 80%\n"
+                f"Current market: {self.engine.smc.market_structure.value}\n"
+                f"Anomaly score: {self.engine.anomaly.baseline_std if self.engine.anomaly.baseline_std else 'N/A'}\n\n"
+                "Waiting for institutional confluence...",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔄 Refresh", callback_data="analyze")],
+                    [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+                ])
+            )
+            return
 
-    message += f"""
-*Context:*
-Structure: {structure.upper() if isinstance(structure, str) else structure}
-Trend: {trend}/1.0
-Session: {session.upper() if isinstance(session, str) else session}
-Vol: {vol.upper() if isinstance(vol, str) else vol}
-Delta: {delta.upper() if isinstance(delta, str) else delta}
-SMC Pressure: {smc_pressure:+.2f}
-"""
+        self.last_signal = signal
 
-    keyboard = [
-        [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-        [InlineKeyboardButton("📊 Structure", callback_data="structure")],
-        [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-    ]
+        emoji = "🟢" if signal.direction == "LONG" else "🔴"
+        direction_text = f"{emoji} *{signal.direction}* {emoji}"
 
-    reply_markup = InlineKeyboardMarkup(keyboard)
+        message = (
+            f"{direction_text}\n\n"
+            f"📍 Entry: `{signal.entry}`\n"
+            f"🛑 Stop: `{signal.stop_loss}`\n"
+            f"🎯 TP1: `{signal.take_profit_1}` (1:{signal.risk_reward_1})\n"
+            f"🎯 TP2: `{signal.take_profit_2}` (1:{signal.risk_reward_2})\n\n"
+            f"🎯 Confidence: *{signal.confidence}%*\n"
+            f"📊 Position: {signal.position_size*100:.2f}%\n"
+            f"⚠️ Slippage: ±{signal.expected_slippage*100:.2f}%\n\n"
+            f"*ML Prediction:* {signal.ml_prediction:+.4f}\n"
+            f"*Anomaly Score:* {signal.anomaly_score:.2f}\n\n"
+            f"*Confluence ({len(signal.reasons)} factors):*\n"
+        )
 
-    await update.message.reply_text(
-        text=message,
-        reply_markup=reply_markup,
-        parse_mode="Markdown"
+        for i, reason in enumerate(signal.reasons[:8], 1):
+            message += f"{i}. {reason}\n"
+
+        context = signal.context
+
+        structure = context.get("structure", "N/A")
+        trend = context.get("trend_strength", "N/A")
+        session = context.get("session", "N/A")
+        vol = context.get("volatility", "N/A")
+        delta = context.get("delta_bias", "N/A")
+        smc_pressure = context.get("smart_money_pressure", 0.0)
+
+        message += (
+            f"\n*Context:*\n"
+            f"Structure: {structure.upper() if isinstance(structure, str) else structure}\n"
+            f"Trend: {trend}/1.0\n"
+            f"Session: {session.upper() if isinstance(session, str) else session}\n"
+            f"Vol: {vol.upper() if isinstance(vol, str) else vol}\n"
+            f"Delta: {delta.upper() if isinstance(delta, str) else delta}\n"
+            f"SMC Pressure: {smc_pressure:+.2f}"
+        )
+
+        keyboard = [
+            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+            [InlineKeyboardButton("📊 Structure", callback_data="structure")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+        ]
+
+        reply_markup = InlineKeyboardMarkup(keyboard)
+
+        await query.edit_message_text(
+            text=message,
+            reply_markup=reply_markup,
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        logger.error(f"Analysis error: {e}")
+        await query.edit_message_text(
+            "❌ Analysis failed. Please retry.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
+        )
+
+async def _get_alternative_data(self) -> Dict:
+    try:
+        dxy = await self.alt_data.get_dxy_correlation()
+        yields = await self.alt_data.get_yield_correlation()
+        btc = await self.alt_data.get_btc_correlation()
+        
+        return {
+            "dxy_corr": dxy,
+            "yield_corr": yields,
+            "btc_corr": btc,
+            "timestamp": datetime.now().isoformat()
+        }
+    except:
+        return {
+            "dxy_corr": -0.85,
+            "yield_corr": -0.75,
+            "btc_corr": 0.45,
+            "timestamp": datetime.now().isoformat()
+        }
+
+async def _show_structure(self, query):
+    if not self.last_signal:
+        await query.edit_message_text(
+            "No active analysis. Run full analysis first.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+        )
+        return
+    
+    context = self.last_signal.context
+    
+    message = (
+        f"📊 *MARKET STRUCTURE ANALYSIS*\n\n"
+        f"Structure: {context['structure'].upper()}\n"
+        f"Trend Strength: {context['trend_strength']}/1.0\n"
+        f"Session: {context['session'].upper()}\n"
+        f"Volatility: {context['volatility'].upper()}\n"
+        f"Risk Level: {self.last_signal.context.get('risk_level', 'medium').upper()}\n\n"
+        f"SMC Pressure: {context['smart_money_pressure']:+.2f}\n"
+        f"Delta Bias: {context['delta_bias'].upper()}\n"
+        f"Correlation Score: {context.get('correlation_score', 0):.2f}"
+    )
+    
+    await query.edit_message_text(
+        message,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+        ])
+    )
+
+async def _show_orderflow(self, query):
+    delta_metrics = self.engine.order_flow.calculate_delta_metrics()
+    icebergs = self.engine.order_flow.detect_iceberg_orders()
+    spoofs = self.engine.order_flow.detect_spoofing()
+    
+    message = (
+        f"⚡ *ORDER FLOW ANALYSIS*\n\n"
+        f"Cumulative Delta: {delta_metrics['delta']:+.0f}\n"
+        f"Delta Slope: {delta_metrics['delta_slope']:+.2f}\n"
+        f"Buying Pressure: {delta_metrics['buying_pressure']*100:.1f}%\n"
+        f"Divergence: {'Yes' if delta_metrics['delta_divergence'] else 'No'}\n\n"
+        f"Iceberg Orders: {len(icebergs)}\n"
+        f"Spoofing Detected: {len(spoofs)}"
+    )
+    
+    await query.edit_message_text(
+        message,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+        ])
+    )
+
+async def _show_ml_prediction(self, query):
+    if not self.last_signal:
+        await query.edit_message_text(
+            "No active analysis. Run full analysis first.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+        )
+        return
+    
+    message = (
+        f"🤖 *ML ENSEMBLE PREDICTION*\n\n"
+        f"LSTM Prediction: {self.last_signal.ml_prediction:+.4f}\n"
+        f"ML Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
+        f"Anomaly Score: {self.last_signal.anomaly_score:.2f}/5.0\n\n"
+        f"Expected Slippage: ±{self.last_signal.expected_slippage*100:.2f}%\n"
+        f"Time Decay: {self.last_signal.time_decay:.4f}"
+    )
+    
+    await query.edit_message_text(
+        message,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+        ])
+    )
+
+async def _show_settings(self, query):
+    await query.edit_message_text(
+        "⚙️ *SETTINGS*\n\n"
+        "Min Confidence: 80%\n"
+        "Risk per Trade: 2%\n"
+        "Max Daily Loss: 6%\n"
+        "R:R Target 1: 1:2\n"
+        "R:R Target 2: 1:3\n"
+        "Timeframes: 1m, 5m, 15m, 1h\n"
+        "News Filter: ON\n"
+        "Anomaly Detection: ON",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+        ])
     )
