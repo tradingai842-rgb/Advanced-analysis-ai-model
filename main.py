@@ -1973,7 +1973,6 @@ if __name__ == "__main__":
            application = Application.builder().token(self.token).build()
            application.add_handler(CommandHandler("start", self.start_command))
            application.add_handler(CallbackQueryHandler(self.button_callback))
-           application.run_polling()
    
    TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
    bot = TradingBot(TOKEN)
