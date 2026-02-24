@@ -1226,12 +1226,12 @@ class XAUUSDBot:
         
         try:
             async with self.data_client as client:
-                df_1m = await client.get_ohlcv("XAU/USD", "1min", 500)
-                df_5m = await client.get_ohlcv("XAU/USD", "5min", 500)
-                df_15m = await client.get_ohlcv("XAU/USD", "15min", 300)
-                df_1h = await client.get_ohlcv("XAU/USD", "1h", 200)
+                df_1m = await client.get_ohlcv("XAUUSD", "1min", 500)
+                df_5m = await client.get_ohlcv("XAUUSD", "5min", 500)
+                df_15m = await client.get_ohlcv("XAUUSD", "15min", 300)
+                df_1h = await client.get_ohlcv("XAUUSD", "1h", 200)
                 
-                quote = await client.get_quote("XAU/USD")
+                quote = await client.get_quote("XAUUSD")
                 current_price = float(quote.get("price", 0)) if quote else 0
             
             if df_1m is None or df_5m is None or current_price == 0:
