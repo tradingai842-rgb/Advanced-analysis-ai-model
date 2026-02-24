@@ -1501,21 +1501,21 @@ class XAUUSDBot:
         )
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        query = update.callback_query
-        await query.answer()
-        
-        if query.data == "analyze":
-    await self._run_full_analysis(query)
-elif query.data == "structure":
-    await self._show_structure(query)
-elif query.data == "orderflow":
-    await self._show_orderflow(query)
-elif query.data == "ml":
-    await self._show_ml_prediction(query)
-elif query.data == "settings":
-    await self._show_settings(query)
-elif query.data == "back":
-    await self.start(update, context)
+    query = update.callback_query
+    await query.answer()
+
+    if query.data == "analyze":
+        await self._run_full_analysis(query)
+    elif query.data == "structure":
+        await self._show_structure(query)
+    elif query.data == "orderflow":
+        await self._show_orderflow(query)
+    elif query.data == "ml":
+        await self._show_ml_prediction(query)
+    elif query.data == "settings":
+        await self._show_settings(query)
+    elif query.data == "back":
+        await self.start(update, context)
 
 async def _run_full_analysis(self, query):
     await query.edit_message_text("🔬 Running maximum analysis across all modules...")
