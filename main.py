@@ -1609,135 +1609,373 @@ async def _run_full_analysis(self, query):
             [InlineKeyboardButton("⬅️ Back", callback_data="back")]
         ]
 
-        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await query.edit_message_text(
-            text=message,
-            reply_markup=reply_markup,
-            parse_mode="Markdown"
-        )
+       await query.edit_message_text(
+           text=message,
+           reply_markup=reply_markup,
+           parse_mode="Markdown"
+       )
 
-    except Exception as e:
-        logger.error(f"Analysis error: {e}")
-        await query.edit_message_text(
-            "❌ Analysis failed. Please retry.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
-        )
+   except Exception as e:
+       logger.error(f"Analysis error: {e}")
+       await query.edit_message_text(
+           "❌ Analysis failed. Please retry.",
+           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
+       )
 
 async def _get_alternative_data(self) -> Dict:
-    try:
-        dxy = await self.alt_data.get_dxy_correlation()
-        yields = await self.alt_data.get_yield_correlation()
-        btc = await self.alt_data.get_btc_correlation()
-        
-        return {
-            "dxy_corr": dxy,
-            "yield_corr": yields,
-            "btc_corr": btc,
-            "timestamp": datetime.now().isoformat()
-        }
-    except:
-        return {
-            "dxy_corr": -0.85,
-            "yield_corr": -0.75,
-            "btc_corr": 0.45,
-            "timestamp": datetime.now().isoformat()
-        }
+   try:
+       dxy = await self.alt_data.get_dxy_correlation()
+       yields = await self.alt_data.get_yield_correlation()
+       btc = await self.alt_data.get_btc_correlation()
+
+       return {
+           "dxy_corr": dxy,
+           "yield_corr": yields,
+           "btc_corr": btc,
+           "timestamp": datetime.now().isoformat()
+       }
+   except:
+       return {
+           "dxy_corr": -0.85,
+           "yield_corr": -0.75,
+           "btc_corr": 0.45,
+           "timestamp": datetime.now().isoformat()
+       }
 
 async def _show_structure(self, query):
-    if not self.last_signal:
-        await query.edit_message_text(
-            "No active analysis. Run full analysis first.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
-        )
-        return
-    
-    context = self.last_signal.context
-    
-    message = (
-        f"📊 *MARKET STRUCTURE ANALYSIS*\n\n"
-        f"Structure: {context['structure'].upper()}\n"
-        f"Trend Strength: {context['trend_strength']}/1.0\n"
-        f"Session: {context['session'].upper()}\n"
-        f"Volatility: {context['volatility'].upper()}\n"
-        f"Risk Level: {self.last_signal.context.get('risk_level', 'medium').upper()}\n\n"
-        f"SMC Pressure: {context['smart_money_pressure']:+.2f}\n"
-        f"Delta Bias: {context['delta_bias'].upper()}\n"
-        f"Correlation Score: {context.get('correlation_score', 0):.2f}"
-    )
-    
-    await query.edit_message_text(
-        message,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-        ])
-    )
+   if not self.last_signal:
+       await query.edit_message_text(
+           "No active analysis. Run full analysis first.",
+           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+       )
+       return
+
+   context = self.last_signal.context
+
+   message = (
+       f"📊 *MARKET STRUCTURE ANALYSIS*\n\n"
+       f"Structure: {context['structure'].upper()}\n"
+       f"Trend Strength: {context['trend_strength']}/1.0\n"
+       f"Session: {context['session'].upper()}\n"
+       f"Volatility: {context['volatility'].upper()}\n"
+       f"Risk Level: {self.last_signal.context.get('risk_level', 'medium').upper()}\n\n"
+       f"SMC Pressure: {context['smart_money_pressure']:+.2f}\n"
+       f"Delta Bias: {context['delta_bias'].upper()}\n"
+       f"Correlation Score: {context.get('correlation_score', 0):.2f}"
+   )
+
+   await query.edit_message_text(
+       message,
+       parse_mode="Markdown",
+       reply_markup=InlineKeyboardMarkup([
+           [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+       ])
+   )
 
 async def _show_orderflow(self, query):
-    delta_metrics = self.engine.order_flow.calculate_delta_metrics()
-    icebergs = self.engine.order_flow.detect_iceberg_orders()
-    spoofs = self.engine.order_flow.detect_spoofing()
-    
-    message = (
-        f"⚡ *ORDER FLOW ANALYSIS*\n\n"
-        f"Cumulative Delta: {delta_metrics['delta']:+.0f}\n"
-        f"Delta Slope: {delta_metrics['delta_slope']:+.2f}\n"
-        f"Buying Pressure: {delta_metrics['buying_pressure']*100:.1f}%\n"
-        f"Divergence: {'Yes' if delta_metrics['delta_divergence'] else 'No'}\n\n"
-        f"Iceberg Orders: {len(icebergs)}\n"
-        f"Spoofing Detected: {len(spoofs)}"
-    )
-    
-    await query.edit_message_text(
-        message,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-        ])
-    )
+   delta_metrics = self.engine.order_flow.calculate_delta_metrics()
+   icebergs = self.engine.order_flow.detect_iceberg_orders()
+   spoofs = self.engine.order_flow.detect_spoofing()
+
+   message = (
+       f"⚡ *ORDER FLOW ANALYSIS*\n\n"
+       f"Cumulative Delta: {delta_metrics['delta']:+.0f}\n"
+       f"Delta Slope: {delta_metrics['delta_slope']:+.2f}\n"
+       f"Buying Pressure: {delta_metrics['buying_pressure']*100:.1f}%\n"
+       f"Divergence: {'Yes' if delta_metrics['delta_divergence'] else 'No'}\n\n"
+       f"Iceberg Orders: {len(icebergs)}\n"
+       f"Spoofing Detected: {len(spoofs)}"
+   )
+
+   await query.edit_message_text(
+       message,
+       parse_mode="Markdown",
+       reply_markup=InlineKeyboardMarkup([
+           [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+       ])
+   )
 
 async def _show_ml_prediction(self, query):
-    if not self.last_signal:
-        await query.edit_message_text(
-            "No active analysis. Run full analysis first.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
-        )
-        return
-    
-    message = (
-        f"🤖 *ML ENSEMBLE PREDICTION*\n\n"
-        f"LSTM Prediction: {self.last_signal.ml_prediction:+.4f}\n"
-        f"ML Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
-        f"Anomaly Score: {self.last_signal.anomaly_score:.2f}/5.0\n\n"
-        f"Expected Slippage: ±{self.last_signal.expected_slippage*100:.2f}%\n"
-        f"Time Decay: {self.last_signal.time_decay:.4f}"
-    )
-    
-    await query.edit_message_text(
-        message,
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-        ])
-    )
+   if not self.last_signal:
+       await query.edit_message_text(
+           "No active analysis. Run full analysis first.",
+           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+       )
+       return
+
+   message = (
+       f"🤖 *ML ENSEMBLE PREDICTION*\n\n"
+       f"LSTM Prediction: {self.last_signal.ml_prediction:+.4f}\n"
+       f"ML Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
+       f"Anomaly Score: {self.last_signal.anomaly_score:.2f}/5.0\n\n"
+       f"Expected Slippage: ±{self.last_signal.expected_slippage*100:.2f}%\n"
+       f"Time Decay: {self.last_signal.time_decay:.4f}"
+   )
+
+   await query.edit_message_text(
+       message,
+       parse_mode="Markdown",
+       reply_markup=InlineKeyboardMarkup([
+           [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+       ])
+   )
 
 async def _show_settings(self, query):
-    await query.edit_message_text(
-        "⚙️ *SETTINGS*\n\n"
-        "Min Confidence: 80%\n"
-        "Risk per Trade: 2%\n"
-        "Max Daily Loss: 6%\n"
-        "R:R Target 1: 1:2\n"
-        "R:R Target 2: 1:3\n"
-        "Timeframes: 1m, 5m, 15m, 1h\n"
-        "News Filter: ON\n"
-        "Anomaly Detection: ON",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-        ])
-    )
+   await query.edit_message_text(
+       "⚙️ *SETTINGS*\n\n"
+       "Min Confidence: 80%\n"
+       "Risk per Trade: 2%\n"
+       "Max Daily Loss: 6%\n"
+       "R:R Target 1: 1:2\n"
+       "R:R Target 2: 1:3\n"
+       "Timeframes: 1m, 5m, 15m, 1h\n"
+       "News Filter: ON\n"
+       "Anomaly Detection: ON",
+       parse_mode="Markdown",
+       reply_markup=InlineKeyboardMarkup([
+           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+       ])
+   )
+
+async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+   keyboard = [
+       [InlineKeyboardButton("🔥 Analyze Market", callback_data="analyze")],
+       [InlineKeyboardButton("📊 Structure", callback_data="structure"),
+        InlineKeyboardButton("⚡ Order Flow", callback_data="orderflow")],
+       [InlineKeyboardButton("🤖 ML Prediction", callback_data="ml_prediction"),
+        InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
+   ]
+   reply_markup = InlineKeyboardMarkup(keyboard)
+   
+   await update.message.reply_text(
+       "🚀 *Welcome to Trading Analysis Bot*\n\n"
+       "Select an option below to begin:",
+       parse_mode="Markdown",
+       reply_markup=reply_markup
+   )
+
+async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+   query = update.callback_query
+   await query.answer()
+   
+   if query.data == "analyze":
+       await self._run_analysis(query)
+   elif query.data == "structure":
+       await self._show_structure(query)
+   elif query.data == "orderflow":
+       await self._show_orderflow(query)
+   elif query.data == "ml_prediction":
+       await self._show_ml_prediction(query)
+   elif query.data == "settings":
+       await self._show_settings(query)
+   elif query.data == "back":
+       await self.start_command(update, context)
+
+def run(self):
+   application = Application.builder().token(self.token).build()
+   
+   application.add_handler(CommandHandler("start", self.start_command))
+   application.add_handler(CallbackQueryHandler(self.button_callback))
+   
+   application.run_polling()
+
+if __name__ == "__main__":
+   import logging
+   from datetime import datetime
+   from typing import Dict
+   from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+   from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+   
+   logging.basicConfig(
+       format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+       level=logging.INFO
+   )
+   logger = logging.getLogger(__name__)
+   
+   class TradingBot:
+       def __init__(self, token):
+           self.token = token
+           self.last_signal = None
+           self.engine = None
+           self.alt_data = None
+       
+       async def _run_analysis(self, query):
+           try:
+               message = "✅ Analysis complete!"
+               keyboard = [
+                   [InlineKeyboardButton("📊 Structure", callback_data="structure"),
+                    InlineKeyboardButton("⚡ Order Flow", callback_data="orderflow")],
+                   [InlineKeyboardButton("🤖 ML Prediction", callback_data="ml_prediction"),
+                    InlineKeyboardButton("⬅️ Back", callback_data="back")]
+               ]
+               reply_markup = InlineKeyboardMarkup(keyboard)
+               await query.edit_message_text(
+                   text=message,
+                   reply_markup=reply_markup,
+                   parse_mode="Markdown"
+               )
+           except Exception as e:
+               logger.error(f"Analysis error: {e}")
+               await query.edit_message_text(
+                   "❌ Analysis failed. Please retry.",
+                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
+               )
+       
+       async def _get_alternative_data(self) -> Dict:
+           try:
+               dxy = await self.alt_data.get_dxy_correlation()
+               yields = await self.alt_data.get_yield_correlation()
+               btc = await self.alt_data.get_btc_correlation()
+               return {
+                   "dxy_corr": dxy,
+                   "yield_corr": yields,
+                   "btc_corr": btc,
+                   "timestamp": datetime.now().isoformat()
+               }
+           except:
+               return {
+                   "dxy_corr": -0.85,
+                   "yield_corr": -0.75,
+                   "btc_corr": 0.45,
+                   "timestamp": datetime.now().isoformat()
+               }
+       
+       async def _show_structure(self, query):
+           if not self.last_signal:
+               await query.edit_message_text(
+                   "No active analysis. Run full analysis first.",
+                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+               )
+               return
+           context = self.last_signal.context
+           message = (
+               f"📊 *MARKET STRUCTURE ANALYSIS*\n\n"
+               f"Structure: {context['structure'].upper()}\n"
+               f"Trend Strength: {context['trend_strength']}/1.0\n"
+               f"Session: {context['session'].upper()}\n"
+               f"Volatility: {context['volatility'].upper()}\n"
+               f"Risk Level: {self.last_signal.context.get('risk_level', 'medium').upper()}\n\n"
+               f"SMC Pressure: {context['smart_money_pressure']:+.2f}\n"
+               f"Delta Bias: {context['delta_bias'].upper()}\n"
+               f"Correlation Score: {context.get('correlation_score', 0):.2f}"
+           )
+           await query.edit_message_text(
+               message,
+               parse_mode="Markdown",
+               reply_markup=InlineKeyboardMarkup([
+                   [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+               ])
+           )
+       
+       async def _show_orderflow(self, query):
+           delta_metrics = self.engine.order_flow.calculate_delta_metrics()
+           icebergs = self.engine.order_flow.detect_iceberg_orders()
+           spoofs = self.engine.order_flow.detect_spoofing()
+           message = (
+               f"⚡ *ORDER FLOW ANALYSIS*\n\n"
+               f"Cumulative Delta: {delta_metrics['delta']:+.0f}\n"
+               f"Delta Slope: {delta_metrics['delta_slope']:+.2f}\n"
+               f"Buying Pressure: {delta_metrics['buying_pressure']*100:.1f}%\n"
+               f"Divergence: {'Yes' if delta_metrics['delta_divergence'] else 'No'}\n\n"
+               f"Iceberg Orders: {len(icebergs)}\n"
+               f"Spoofing Detected: {len(spoofs)}"
+           )
+           await query.edit_message_text(
+               message,
+               parse_mode="Markdown",
+               reply_markup=InlineKeyboardMarkup([
+                   [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+               ])
+           )
+       
+       async def _show_ml_prediction(self, query):
+           if not self.last_signal:
+               await query.edit_message_text(
+                   "No active analysis. Run full analysis first.",
+                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+               )
+               return
+           message = (
+               f"🤖 *ML ENSEMBLE PREDICTION*\n\n"
+               f"LSTM Prediction: {self.last_signal.ml_prediction:+.4f}\n"
+               f"ML Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
+               f"Anomaly Score: {self.last_signal.anomaly_score:.2f}/5.0\n\n"
+               f"Expected Slippage: ±{self.last_signal.expected_slippage*100:.2f}%\n"
+               f"Time Decay: {self.last_signal.time_decay:.4f}"
+           )
+           await query.edit_message_text(
+               message,
+               parse_mode="Markdown",
+               reply_markup=InlineKeyboardMarkup([
+                   [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+               ])
+           )
+       
+       async def _show_settings(self, query):
+           await query.edit_message_text(
+               "⚙️ *SETTINGS*\n\n"
+               "Min Confidence: 80%\n"
+               "Risk per Trade: 2%\n"
+               "Max Daily Loss: 6%\n"
+               "R:R Target 1: 1:2\n"
+               "R:R Target 2: 1:3\n"
+               "Timeframes: 1m, 5m, 15m, 1h\n"
+               "News Filter: ON\n"
+               "Anomaly Detection: ON",
+               parse_mode="Markdown",
+               reply_markup=InlineKeyboardMarkup([
+                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+               ])
+           )
+       
+       async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+           keyboard = [
+               [InlineKeyboardButton("🔥 Analyze Market", callback_data="analyze")],
+               [InlineKeyboardButton("📊 Structure", callback_data="structure"),
+                InlineKeyboardButton("⚡ Order Flow", callback_data="orderflow")],
+               [InlineKeyboardButton("🤖 ML Prediction", callback_data="ml_prediction"),
+                InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
+           ]
+           reply_markup = InlineKeyboardMarkup(keyboard)
+           await update.message.reply_text(
+               "🚀 *Welcome to Trading Analysis Bot*\n\n"
+               "Select an option below to begin:",
+               parse_mode="Markdown",
+               reply_markup=reply_markup
+           )
+       
+       async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+           query = update.callback_query
+           await query.answer()
+           if query.data == "analyze":
+               await self._run_analysis(query)
+           elif query.data == "structure":
+               await self._show_structure(query)
+           elif query.data == "orderflow":
+               await self._show_orderflow(query)
+           elif query.data == "ml_prediction":
+               await self._show_ml_prediction(query)
+           elif query.data == "settings":
+               await self._show_settings(query)
+           elif query.data == "back":
+               await self.start_command(update, context)
+       
+       def run(self):
+           application = Application.builder().token(self.token).build()
+           application.add_handler(CommandHandler("start", self.start_command))
+           application.add_handler(CallbackQueryHandler(self.button_callback))
+           application.run_polling()
+   
+   TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
+   bot = TradingBot(TOKEN)
+   bot.run()
+   
