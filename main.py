@@ -1581,26 +1581,36 @@ class XAUUSDBot:
                 f"*Confluence ({len(signal.reasons)} factors):*\n"
             )
             
-            for i, reason in enumerate(signal.reasons[:8], 1):
-                message += f"{i}. {reason}\n"
-            
-            message += f"""
+           for i, reason in enumerate(signal.reasons[:8], 1):
+        message += f"{i}. {reason}\n"
+
+    context = signal.context
+    structure = context.get('structure', 'N/A')
+    trend = context.get('trend_strength', 'N/A')
+    session = context.get('session', 'N/A')
+    vol = context.get('volatility', 'N/A')
+    delta = context.get('delta_bias', 'N/A')
+    smc_pressure = context.get('smart_money_pressure', 0.0)
+
+    message += f"""
 *Context:*
-Structure: {signal.context['structure'].upper()}
-Trend: {signal.context['trend_strength']}/1.0
-Session: {signal.context['session'].upper()}
-Vol: {signal.context['volatility'].upper()}
-Delta: {signal.context['delta_bias'].upper()}
-SMC Pressure: {signal.context['smart_money_pressure']:+.2f}
+Structure: {structure.upper() if isinstance(structure, str) else structure}
+Trend: {trend}/1.0
+Session: {session.upper() if isinstance(session, str) else session}
+Vol: {vol.upper() if isinstance(vol, str) else vol}
+Delta: {delta.upper() if isinstance(delta, str) else delta}
+SMC Pressure: {smc_pressure:+.2f}
 """
 
-keyboard = [
-    [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-    [InlineKeyboardButton("📊 Structure", callback_data="structure")],
-    [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-]
+    keyboard = [
+        [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+        [InlineKeyboardButton("📊 Structure", callback_data="structure")],
+        [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+    ]
 
-reply_markup = InlineKeyboardMarkup(keyboard)
+    reply_markup = InlineKeyboardMarkup(keyboard)
 
-await update.message.reply_text(text_message, reply_markup=reply_markup)
-            
+    await update.message.reply_text(text=message, reply_markup=reply_markup, parse_mode="Markdown")
+
+
+   
