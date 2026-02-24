@@ -1525,7 +1525,7 @@ async def _run_full_analysis(self, query):
             df_1m = await client.get_ohlcv("XAU/USD", "1min", outputsize=500)
             df_5m = await client.get_ohlcv("XAU/USD", "5min", outputsize=500)
             df_15m = await client.get_ohlcv("XAU/USD", "15min", outputsize=300)
-            df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=201)
+            df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=200)
 
         news_task = self.news_filter.get_trading_conditions()
         alt_task = self._get_alternative_data()
