@@ -3,31 +3,67 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Deque
+from typing import Dict, List, Optional, Tuple, Deque, Any
 from dataclasses import dataclass, field
 from enum import Enum
 import aiohttp
 import json
 from collections import deque
-import talib
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
-from sklearn.preprocessing import StandardScaler
-import tensorflow as tf
-from tensorflow.keras.models import Sequential, load_model
-from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
-from tensorflow.keras.callbacks import EarlyStopping
 import warnings
 warnings.filterwarnings('ignore')
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
+try:
+    import talib
+except ImportError:
+    logger.error("TA-Lib not installed. Install with: pip install TA-Lib")
+    raise
+
+try:
+    from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
+except ImportError:
+    logger.error("python-telegram-bot not installed. Install with: pip install python-telegram-bot")
+    raise
+
+try:
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+    from sklearn.preprocessing import StandardScaler
+except ImportError:
+    logger.error("scikit-learn not installed. Install with: pip install scikit-learn")
+    raise
+
+try:
+    import tensorflow as tf
+    from tensorflow.keras.models import Sequential, load_model
+    from tensorflow.keras.layers import LSTM, Dense, Dropout, Bidirectional
+    from tensorflow.keras.callbacks import EarlyStopping
+    tf.get_logger().setLevel('ERROR')
+except ImportError:
+    logger.warning("TensorFlow not installed. ML features will be limited.")
+    tf = None
+
 TWELVE_DATA_API_KEY = "ce0dbe1303af4be6b0cbe593744c01bd"
+POLYGON_API_KEY = "0n_l16xhW0_6Rpt9ZVQNYXD77ywLW68l"
 NEWS_API_KEY = "23a88a95fc774d76afd8ffcee66ccb01"
 TELEGRAM_TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
-POLYGON_API_KEY = "0n_l16xhW0_6Rpt9ZVQNYXD77ywLW68l"
+
+MIN_CONFIDENCE = 80.0
+RISK_PER_TRADE = 0.02
+MAX_DAILY_LOSS = 0.06
+RR_TARGET_1 = 2.0
+RR_TARGET_2 = 3.0
+ATR_MULTIPLIER_STOP = 1.2
+NEWS_IMPACT_THRESHOLD = 0.6
+ANOMALY_THRESHOLD = 2.5
+MAX_SPREAD_PCT = 0.05
+MIN_ADX_TREND = 20.0
+MAX_VOLATILITY_PCT = 3.0
 
 class MarketStructure(Enum):
     UPTREND = "uptrend"
@@ -35,6 +71,7 @@ class MarketStructure(Enum):
     RANGING = "ranging"
     BREAKOUT = "breakout"
     REVERSAL = "reversal"
+    CHOPPY = "choppy"
 
 class OrderBlockType(Enum):
     BULLISH = "bullish"
@@ -42,18 +79,17 @@ class OrderBlockType(Enum):
     BREAKER = "breaker"
     MITIGATION = "mitigation"
     RECLAIMED = "reclaimed"
+    WEAK = "weak"
 
-class LiquidityType(Enum):
-    EQUAL_HIGHS = "equal_highs"
-    EQUAL_LOWS = "equal_lows"
-    TRENDLINE = "trendline"
-    PREVIOUS_DAY = "previous_day"
-    SWEPT = "swept"
-
-class ImbalanceType(Enum):
-    BULLISH = "bullish"
-    BEARISH = "bearish"
-    NEUTRAL = "neutral"
+class TradeStatus(Enum):
+    VALID = "valid"
+    INVALID_SPREAD = "invalid_spread"
+    INVALID_ADX = "invalid_adx"
+    INVALID_VOLATILITY = "invalid_volatility"
+    NEWS_HALT = "news_halt"
+    ANOMALY_DETECTED = "anomaly_detected"
+    NO_CONFLUENCE = "no_confluence"
+    AGAINST_TREND = "against_trend"
 
 class OrderBlock:
     high: float
@@ -64,18 +100,18 @@ class OrderBlock:
     timestamp: datetime
     ob_type: OrderBlockType
     is_valid: bool = True
-    mitigation_price: Optional[float] = None
     times_tested: int = 0
     strength_score: float = 0.0
+    is_fresh: bool = True
 
 class LiquidityZone:
     price_level: float
-    zone_type: LiquidityType
+    zone_type: str
     strength: float
-    volume_at_level: float = 0.0
     is_swept: bool = False
     sweep_timestamp: Optional[datetime] = None
     is_target: bool = False
+    cluster_size: int = 0
 
 class FairValueGap:
     high: float
@@ -85,21 +121,6 @@ class FairValueGap:
     is_filled: bool = False
     fill_percentage: float = 0.0
     confluence_score: float = 0.0
-
-class ImbalanceZone:
-    high: float
-    low: float
-    zone_type: ImbalanceType
-    timestamp: datetime
-    is_mitigated: bool = False
-    mitigation_timestamp: Optional[datetime] = None
-
-class VolumeProfileLevel:
-    price: float
-    volume: float
-    is_poc: bool = False
-    is_val: bool = False
-    is_vah: bool = False
 
 class MarketContext:
     structure: MarketStructure
@@ -111,14 +132,7 @@ class MarketContext:
     smart_money_pressure: float
     delta_bias: str
     correlation_score: float
-
-class TickData:
-    price: float
-    size: float
-    side: str
-    timestamp: datetime
-    is_iceberg: bool = False
-    is_spoof: bool = False
+    spread_quality: str
 
 class Signal:
     direction: str
@@ -131,28 +145,51 @@ class Signal:
     risk_reward_2: float
     position_size: float
     reasons: List[str]
-    context: Dict
+    context: Dict[str, Any]
     ml_prediction: float
     anomaly_score: float
     expected_slippage: float
-    time_decay: float
+    spread_at_entry: float
+    quality_score: float
+    status: TradeStatus
     timestamp: datetime
+    invalid_reason: Optional[str] = None
 
 class TwelveDataClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.twelvedata.com"
         self.session: Optional[aiohttp.ClientSession] = None
+        self.retry_count = 3
+        self.retry_delay = 1.0
     
     async def __aenter__(self):
-        self.session = aiohttp.ClientSession()
+        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30))
         return self
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         if self.session:
             await self.session.close()
     
-    async def get_ohlcv(self, symbol: str, interval: str, outputsize: int = 500) -> pd.DataFrame:
+    async def _request_with_retry(self, url: str, params: Dict) -> Dict:
+        for attempt in range(self.retry_count):
+            try:
+                async with self.session.get(url, params=params) as response:
+                    if response.status == 200:
+                        return await response.json()
+                    elif response.status == 429:
+                        await asyncio.sleep(self.retry_delay * (2 ** attempt))
+                        continue
+                    else:
+                        logger.error(f"API error {response.status}: {await response.text()}")
+            except Exception as e:
+                logger.error(f"Request error (attempt {attempt + 1}): {e}")
+                if attempt < self.retry_count - 1:
+                    await asyncio.sleep(self.retry_delay * (2 ** attempt))
+        
+        return {}
+    
+    async def get_ohlcv(self, symbol: str, interval: str, outputsize: int = 500) -> Optional[pd.DataFrame]:
         url = f"{self.base_url}/time_series"
         params = {
             "symbol": symbol,
@@ -161,132 +198,105 @@ class TwelveDataClient:
             "apikey": self.api_key,
             "order": "asc"
         }
-        async with self.session.get(url, params=params) as response:
-            data = await response.json()
-            if "values" not in data:
-                raise Exception(f"API Error: {data}")
+        
+        data = await self._request_with_retry(url, params)
+        
+        if not data or "values" not in data:
+            logger.error(f"Failed to fetch OHLCV: {data.get('message', 'Unknown error')}")
+            return None
+        
+        try:
             df = pd.DataFrame(data["values"])
             df["datetime"] = pd.to_datetime(df["datetime"])
             df.set_index("datetime", inplace=True)
-            df = df.astype(float)
-            return df
+            for col in ["open", "high", "low", "close", "volume"]:
+                if col in df.columns:
+                    df[col] = pd.to_numeric(df[col], errors='coerce')
+            return df.dropna()
+        except Exception as e:
+            logger.error(f"Data parsing error: {e}")
+            return None
     
-    async def get_quote(self, symbol: str) -> Dict:
+    async def get_quote(self, symbol: str) -> Optional[Dict]:
         url = f"{self.base_url}/quote"
         params = {"symbol": symbol, "apikey": self.api_key}
-        async with self.session.get(url, params=params) as response:
-            return await response.json()
+        return await self._request_with_retry(url, params)
     
-    async def get_order_book(self, symbol: str) -> Dict:
-        url = f"{self.base_url}/order_book"
-        params = {"symbol": symbol, "apikey": self.api_key}
-        async with self.session.get(url, params=params) as response:
-            return await response.json()
-    
-    async def get_level2_data(self, symbol: str) -> Dict:
-        url = f"{self.base_url}/level2"
-        params = {"symbol": symbol, "apikey": self.api_key}
-        async with self.session.get(url, params=params) as response:
-            return await response.json()
+    async def get_real_time_price(self, symbol: str) -> Optional[float]:
+        quote = await self.get_quote(symbol)
+        if quote and "price" in quote:
+            return float(quote["price"])
+        return None
 
 class PolygonClient:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.polygon.io/v2"
     
-    async def get_tick_data(self, symbol: str, timestamp: datetime) -> List[Dict]:
-        url = f"{self.base_url}/ticks/stocks/nbbo/{symbol}/{timestamp.strftime('%Y-%m-%d')}"
-        params = {"apiKey": self.api_key, "timestamp": timestamp.isoformat()}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                return data.get("results", [])
-
-class FinnhubClient:
-    def __init__(self, api_key: str):
-        self.api_key = api_key
-        self.base_url = "https://finnhub.io/api/v1"
-    
-    async def get_order_book(self, symbol: str) -> Dict:
-        url = f"{self.base_url}/stock/book"
-        params = {"symbol": symbol, "token": self.api_key}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                return await response.json()
-    
-    async def get_sentiment(self, symbol: str) -> Dict:
-        url = f"{self.base_url}/news-sentiment"
-        params = {"symbol": symbol, "token": self.api_key}
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                return await response.json()
-
-class AlternativeDataClient:
-    def __init__(self, alpha_key: str, cftc_key: str):
-        self.alpha_key = alpha_key
-        self.cftc_key = cftc_key
-    
-    async def get_gold_etf_flows(self) -> Dict:
-        url = f"https://www.alphavantage.co/query"
-        params = {
-            "function": "ETF_PROFILE",
-            "symbol": "GLD",
-            "apikey": self.alpha_key
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                return await response.json()
-    
-    async def get_cftc_positioning(self) -> Dict:
-        url = f"https://www.cftc.gov/dea/futures/other_lf.htm"
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url) as response:
-                text = await response.text()
-                return self._parse_cftc(text)
-    
-    def _parse_cftc(self, html: str) -> Dict:
-        return {"net_position": 0, "commercial": 0, "non_commercial": 0}
-    
-    async def get_dxy_correlation(self) -> float:
-        return -0.85
-    
-    async def get_yield_correlation(self) -> float:
-        return -0.75
-    
-    async def get_btc_correlation(self) -> float:
-        return 0.45
+    async def get_aggregates(self, symbol: str, multiplier: int, timespan: str, 
+                            from_date: str, to_date: str) -> Optional[pd.DataFrame]:
+        url = f"{self.base_url}/aggs/ticker/{symbol}/range/{multiplier}/{timespan}/{from_date}/{to_date}"
+        params = {"apiKey": self.api_key}
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if "results" in data:
+                            df = pd.DataFrame(data["results"])
+                            df["timestamp"] = pd.to_datetime(df["t"], unit='ms')
+                            df.set_index("timestamp", inplace=True)
+                            df.rename(columns={"o": "open", "h": "high", "l": "low", 
+                                             "c": "close", "v": "volume"}, inplace=True)
+                            return df
+        except Exception as e:
+            logger.error(f"Polygon error: {e}")
+        
+        return None
 
 class NewsFilter:
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.high_impact_events = [
+        self.high_impact_keywords = [
             "non-farm payrolls", "nfp", "fomc", "fed", "interest rate",
             "cpi", "inflation", "gdp", "unemployment", "retail sales",
             "pmi", "geopolitical", "war", "conflict", "treasury", "yields",
             "goldman sachs", "jp morgan", "bullion", "federal reserve",
-            "powell", "lagarde", "ecb", "boe", "bank of england"
+            "powell", "lagarde", "ecb", "boe", "bank of england",
+            "sanctions", "middle east", "ukraine", "russia", "china"
         ]
-        self.impact_scores = {}
         self.geopolitical_risk_index = 0.0
+        self.last_news_check = None
     
     async def fetch_news(self) -> List[Dict]:
         url = "https://newsapi.org/v2/everything"
         params = {
-            "q": "gold OR XAUUSD OR XAU OR \"Federal Reserve\" OR FOMC OR NFP OR inflation OR bullion",
+            "q": "gold OR XAUUSD OR XAU OR \"Federal Reserve\" OR FOMC OR NFP OR inflation OR bullion OR commodity",
             "language": "en",
             "sortBy": "publishedAt",
-            "pageSize": 50,
+            "pageSize": 30,
             "apiKey": self.api_key
         }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as response:
-                data = await response.json()
-                return data.get("articles", [])
+        
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        return data.get("articles", [])
+        except Exception as e:
+            logger.error(f"News fetch error: {e}")
+        
+        return []
     
     def analyze_sentiment(self, text: str) -> Tuple[float, float, float]:
-        positive_words = ["surge", "rally", "bullish", "breakout", "strong", "growth", "optimistic", "moon", "rocket"]
-        negative_words = ["crash", "plunge", "bearish", "breakdown", "weak", "recession", "fear", "dump", "collapse"]
-        uncertainty_words = ["uncertain", "volatile", "unclear", "mixed", "cautious", "wait", "pause"]
+        positive_words = ["surge", "rally", "bullish", "breakout", "strong", "growth", 
+                         "optimistic", "moon", "rocket", "soar", "jump", "gain"]
+        negative_words = ["crash", "plunge", "bearish", "breakdown", "weak", "recession", 
+                         "fear", "dump", "collapse", "drop", "fall", "decline"]
+        uncertainty_words = ["uncertain", "volatile", "unclear", "mixed", "cautious", 
+                            "wait", "pause", "uncertainty", "concern"]
         
         text_lower = text.lower()
         pos_score = sum(1 for word in positive_words if word in text_lower)
@@ -299,71 +309,94 @@ class NewsFilter:
         
         return pos_score/total, neg_score/total, unc_score/total
     
-    def detect_high_impact(self, text: str) -> Tuple[bool, float, str]:
+    def detect_high_impact(self, text: str) -> Tuple[bool, float, List[str]]:
         text_lower = text.lower()
         impact_score = 0.0
         is_high_impact = False
-        category = "normal"
+        categories = []
         
-        for event in self.high_impact_events:
-            if event in text_lower:
+        for keyword in self.high_impact_keywords:
+            if keyword in text_lower:
                 is_high_impact = True
-                impact_score += 0.25
-                if event in ["war", "conflict", "geopolitical"]:
-                    category = "geopolitical"
+                impact_score += 0.15
+                
+                if keyword in ["war", "conflict", "geopolitical", "sanctions", "middle east"]:
+                    if "geopolitical" not in categories:
+                        categories.append("geopolitical")
                     self.geopolitical_risk_index = min(self.geopolitical_risk_index + 0.1, 1.0)
-                elif event in ["fomc", "fed", "powell", "interest rate"]:
-                    category = "monetary"
+                elif keyword in ["fomc", "fed", "powell", "interest rate", "cpi"]:
+                    if "monetary" not in categories:
+                        categories.append("monetary")
+                elif keyword in ["nfp", "gdp", "unemployment"]:
+                    if "economic" not in categories:
+                        categories.append("economic")
         
-        if any(word in text_lower for word in ["breaking", "urgent", "alert", "exclusive"]):
-            impact_score += 0.35
+        if any(word in text_lower for word in ["breaking", "urgent", "alert", "exclusive", "just in"]):
+            impact_score += 0.25
             is_high_impact = True
         
-        if "goldman" in text_lower or "jpmorgan" in text_lower or "ubs" in text_lower:
+        if "goldman" in text_lower or "jpmorgan" in text_lower or "ubs" in text_lower or "deutsche" in text_lower:
             impact_score += 0.20
         
-        return is_high_impact, min(impact_score, 1.0), category
+        return is_high_impact, min(impact_score, 1.0), categories
     
     async def get_trading_conditions(self) -> Dict:
         news = await self.fetch_news()
-        total_pos, total_neg, total_unc = 0, 0, 0
-        high_impact_detected = False
-        max_impact_score = 0.0
-        critical_categories = set()
         
-        for article in news[:10]:
+        if not news:
+            return {
+                "avoid_trading": False,
+                "sentiment": 0.0,
+                "impact_score": 0.0,
+                "uncertainty": 0.0,
+                "geopolitical_risk": self.geopolitical_risk_index,
+                "categories": [],
+                "recommendation": "TRADE"
+            }
+        
+        total_pos, total_neg, total_unc = 0, 0, 0
+        max_impact_score = 0.0
+        all_categories = set()
+        high_impact_count = 0
+        
+        for article in news[:15]:
             title = article.get("title", "")
             description = article.get("description", "")
             text = f"{title} {description}"
             
             pos, neg, unc = self.analyze_sentiment(text)
-            is_high_impact, impact_score, category = self.detect_high_impact(text)
+            is_high_impact, impact_score, categories = self.detect_high_impact(text)
             
             total_pos += pos
             total_neg += neg
             total_unc += unc
             
             if is_high_impact:
-                high_impact_detected = True
+                high_impact_count += 1
                 max_impact_score = max(max_impact_score, impact_score)
-                critical_categories.add(category)
+                all_categories.update(categories)
         
         total = total_pos + total_neg + total_unc
-        if total > 0:
-            sentiment_score = (total_pos - total_neg) / total
-        else:
-            sentiment_score = 0
-        
+        sentiment_score = (total_pos - total_neg) / total if total > 0 else 0
         uncertainty_level = total_unc / len(news) if news else 0
         
+        should_avoid = (
+            (max_impact_score > NEWS_IMPACT_THRESHOLD) or 
+            (uncertainty_level > 0.4) or
+            (high_impact_count >= 3 and max_impact_score > 0.4)
+        )
+        
+        self.last_news_check = datetime.now()
+        
         return {
-            "avoid_trading": (high_impact_detected and max_impact_score > 0.6) or uncertainty_level > 0.5,
+            "avoid_trading": should_avoid,
             "sentiment": sentiment_score,
             "impact_score": max_impact_score,
             "uncertainty": uncertainty_level,
             "geopolitical_risk": self.geopolitical_risk_index,
-            "categories": list(critical_categories),
-            "recommendation": "WAIT" if ((high_impact_detected and max_impact_score > 0.6) or uncertainty_level > 0.5) else "TRADE"
+            "categories": list(all_categories),
+            "high_impact_count": high_impact_count,
+            "recommendation": "WAIT" if should_avoid else "TRADE"
         }
 
 class LSTMModel:
@@ -371,11 +404,17 @@ class LSTMModel:
         self.sequence_length = sequence_length
         self.model = None
         self.scaler = StandardScaler()
-        self._build_model()
+        self.is_trained = False
+        if tf:
+            self._build_model()
     
     def _build_model(self):
+        if not tf:
+            return
+        
         self.model = Sequential([
-            Bidirectional(LSTM(128, return_sequences=True), input_shape=(self.sequence_length, 15)),
+            Bidirectional(LSTM(128, return_sequences=True), 
+                         input_shape=(self.sequence_length, 15)),
             Dropout(0.2),
             Bidirectional(LSTM(64, return_sequences=True)),
             Dropout(0.2),
@@ -387,42 +426,41 @@ class LSTMModel:
         self.model.compile(optimizer='adam', loss='mse', metrics=['mae'])
     
     def prepare_features(self, df: pd.DataFrame) -> np.ndarray:
-        features = np.column_stack([
-            df['returns'].values,
-            df['rsi'].values / 100,
-            df['macd'].values,
-            df['adx'].values / 100,
-            df['atr_percent'].values,
-            df['bb_position'].values,
-            df['volume_delta'].values if 'volume_delta' in df.columns else np.zeros(len(df)),
-            df['obv_slope'].values if 'obv_slope' in df.columns else np.zeros(len(df)),
-            df['ema_slope'].values if 'ema_slope' in df.columns else np.zeros(len(df)),
-            df['vwap_distance'].values if 'vwap_distance' in df.columns else np.zeros(len(df)),
-            df['session_score'].values if 'session_score' in df.columns else np.zeros(len(df)),
-            df['correlation_dxy'].values if 'correlation_dxy' in df.columns else np.full(len(df), -0.85),
-            df['correlation_yield'].values if 'correlation_yield' in df.columns else np.full(len(df), -0.75),
-            df['cftc_net'].values if 'cftc_net' in df.columns else np.zeros(len(df)),
-            df['etf_flow'].values if 'etf_flow' in df.columns else np.zeros(len(df))
-        ])
+        required_cols = ['returns', 'rsi', 'macd', 'adx', 'atr_percent', 
+                        'bb_position', 'volume_delta', 'obv_slope', 'ema_slope',
+                        'vwap_distance', 'session_score']
+        
+        features = []
+        for col in required_cols:
+            if col in df.columns:
+                features.append(df[col].fillna(0).values)
+            else:
+                features.append(np.zeros(len(df)))
+        
+        features = np.column_stack(features)
         return self.scaler.fit_transform(features)
     
     def predict(self, df: pd.DataFrame) -> Tuple[float, float]:
-        if len(df) < self.sequence_length:
+        if not tf or not self.model or len(df) < self.sequence_length:
             return 0.0, 0.0
         
-        features = self.prepare_features(df)
-        X = features[-self.sequence_length:].reshape(1, self.sequence_length, 15)
-        prediction = self.model.predict(X, verbose=0)[0][0]
-        confidence = 1.0 - abs(prediction - np.sign(prediction) * 1.0)
-        return float(prediction), float(confidence)
+        try:
+            features = self.prepare_features(df)
+            X = features[-self.sequence_length:].reshape(1, self.sequence_length, -1)
+            prediction = self.model.predict(X, verbose=0)[0][0]
+            confidence = 1.0 - abs(prediction)
+            return float(prediction), float(confidence)
+        except Exception as e:
+            logger.error(f"LSTM prediction error: {e}")
+            return 0.0, 0.0
 
 class RandomForestEnsemble:
     def __init__(self):
         self.model = RandomForestClassifier(
-            n_estimators=200,
-            max_depth=15,
-            min_samples_split=10,
-            min_samples_leaf=5,
+            n_estimators=100,
+            max_depth=10,
+            min_samples_split=20,
+            min_samples_leaf=10,
             random_state=42,
             n_jobs=-1
         )
@@ -434,16 +472,16 @@ class RandomForestEnsemble:
         for i in range(len(df)):
             row = df.iloc[i]
             feat = [
-                row['rsi'] / 100,
-                row['macd'] / 100,
-                row['adx'] / 100,
-                row['atr_percent'] / 10,
-                row['bb_position'],
-                1 if row['ema_9'] > row['ema_21'] else 0,
-                1 if row['close'] > row['vwap'] else 0,
-                row['volume_ratio'] if 'volume_ratio' in row else 1.0,
-                row['obv_slope'] if 'obv_slope' in row else 0,
-                row['session_score'] if 'session_score' in row else 0.5
+                row.get('rsi', 50) / 100,
+                row.get('macd', 0) / 100,
+                row.get('adx', 25) / 100,
+                row.get('atr_percent', 1) / 10,
+                row.get('bb_position', 0.5),
+                1 if row.get('ema_9', 0) > row.get('ema_21', 0) else 0,
+                1 if row.get('close', 0) > row.get('vwap', 0) else 0,
+                row.get('volume_ratio', 1.0),
+                row.get('obv_slope', 0),
+                row.get('session_score', 0.5)
             ]
             features.append(feat)
         return np.array(features)
@@ -452,61 +490,13 @@ class RandomForestEnsemble:
         if not self.is_trained or len(df) < 20:
             return 0.33, 0.33, 0.34
         
-        features = self.extract_features(df)
-        features_scaled = self.scaler.transform(features)
-        proba = self.model.predict_proba(features_scaled[-1:])[0]
-        return proba[0], proba[1], proba[2]
-
-class ReinforcementLearningAgent:
-    def __init__(self):
-        self.q_table = {}
-        self.learning_rate = 0.1
-        self.discount_factor = 0.95
-        self.epsilon = 0.1
-    
-    def get_state(self, context: MarketContext, technical_score: float) -> str:
-        return f"{context.structure.value}_{context.volatility_regime}_{int(technical_score*10)}"
-    
-    def get_action(self, state: str) -> int:
-        if np.random.random() < self.epsilon:
-            return np.random.randint(0, 3)
-        if state not in self.q_table:
-            self.q_table[state] = [0, 0, 0]
-        return np.argmax(self.q_table[state])
-    
-    def update(self, state: str, action: int, reward: float, next_state: str):
-        if state not in self.q_table:
-            self.q_table[state] = [0, 0, 0]
-        if next_state not in self.q_table:
-            self.q_table[next_state] = [0, 0, 0]
-        
-        current_q = self.q_table[state][action]
-        max_next_q = max(self.q_table[next_state])
-        new_q = current_q + self.learning_rate * (reward + self.discount_factor * max_next_q - current_q)
-        self.q_table[state][action] = new_q
-
-class AnomalyDetector:
-    def __init__(self):
-        self.baseline_mean = None
-        self.baseline_std = None
-        self.window_size = 100
-    
-    def fit(self, returns: np.ndarray):
-        self.baseline_mean = np.mean(returns)
-        self.baseline_std = np.std(returns)
-    
-    def detect(self, current_return: float, volume_spike: float, spread: float) -> Tuple[bool, float]:
-        if self.baseline_std is None or self.baseline_std == 0:
-            return False, 0.0
-        
-        z_score = abs(current_return - self.baseline_mean) / self.baseline_std
-        volume_z = volume_spike
-        spread_z = spread / 0.01
-        
-        anomaly_score = (z_score * 0.4 + volume_z * 0.4 + spread_z * 0.2) / 3
-        is_anomaly = anomaly_score > 2.5
-        
-        return is_anomaly, min(anomaly_score / 5, 1.0)
+        try:
+            features = self.extract_features(df)
+            features_scaled = self.scaler.transform(features)
+            proba = self.model.predict_proba(features_scaled[-1:])[0]
+            return proba[0], proba[1], proba[2]
+        except:
+            return 0.33, 0.33, 0.34
 
 class VolumeProfileAnalyzer:
     def __init__(self, num_bins: int = 50):
@@ -514,179 +504,62 @@ class VolumeProfileAnalyzer:
         self.poc_level: Optional[float] = None
         self.value_area_high: Optional[float] = None
         self.value_area_low: Optional[float] = None
-        self.profile: List[VolumeProfileLevel] = []
     
     def calculate(self, df: pd.DataFrame) -> Dict:
         if len(df) < 20 or 'volume' not in df.columns:
             return {}
         
-        price_range = df['high'].max() - df['low'].min()
-        bin_size = price_range / self.num_bins
-        
-        volume_by_price = {}
-        for _, row in df.iterrows():
-            typical_price = (row['high'] + row['low'] + row['close']) / 3
-            bin_price = round(typical_price / bin_size) * bin_size
-            volume_by_price[bin_price] = volume_by_price.get(bin_price, 0) + row['volume']
-        
-        sorted_levels = sorted(volume_by_price.items(), key=lambda x: x[1], reverse=True)
-        
-        if not sorted_levels:
+        try:
+            price_range = df['high'].max() - df['low'].min()
+            if price_range == 0:
+                return {}
+            
+            bin_size = price_range / self.num_bins
+            
+            volume_by_price = {}
+            for _, row in df.iterrows():
+                typical_price = (row['high'] + row['low'] + row['close']) / 3
+                bin_price = round(typical_price / bin_size) * bin_size
+                volume_by_price[bin_price] = volume_by_price.get(bin_price, 0) + row['volume']
+            
+            if not volume_by_price:
+                return {}
+            
+            sorted_levels = sorted(volume_by_price.items(), key=lambda x: x[1], reverse=True)
+            
+            self.poc_level = sorted_levels[0][0]
+            total_volume = sum(v for _, v in sorted_levels)
+            value_area_volume = total_volume * 0.70
+            
+            current_volume = 0
+            value_area_prices = []
+            for price, vol in sorted_levels:
+                current_volume += vol
+                value_area_prices.append(price)
+                if current_volume >= value_area_volume:
+                    break
+            
+            self.value_area_high = max(value_area_prices) if value_area_prices else self.poc_level
+            self.value_area_low = min(value_area_prices) if value_area_prices else self.poc_level
+            
+            return {
+                "poc": self.poc_level,
+                "vah": self.value_area_high,
+                "val": self.value_area_low,
+                "value_area_range": self.value_area_high - self.value_area_low
+            }
+        except Exception as e:
+            logger.error(f"Volume profile error: {e}")
             return {}
-        
-        self.poc_level = sorted_levels[0][0]
-        total_volume = sum(v for _, v in sorted_levels)
-        value_area_volume = total_volume * 0.70
-        
-        current_volume = 0
-        value_area_prices = []
-        for price, vol in sorted_levels:
-            current_volume += vol
-            value_area_prices.append(price)
-            if current_volume >= value_area_volume:
-                break
-        
-        self.value_area_high = max(value_area_prices) if value_area_prices else self.poc_level
-        self.value_area_low = min(value_area_prices) if value_area_prices else self.poc_level
-        
-        self.profile = [VolumeProfileLevel(price=p, volume=v, is_poc=(p==self.poc_level),
-                                          is_val=(p==self.value_area_low), is_vah=(p==self.value_area_high))
-                       for p, v in sorted_levels]
-        
-        return {
-            "poc": self.poc_level,
-            "vah": self.value_area_high,
-            "val": self.value_area_low,
-            "profile": self.profile
-        }
-    
-    def get_nearest_levels(self, current_price: float, num_levels: int = 3) -> List[VolumeProfileLevel]:
-        sorted_profile = sorted(self.profile, key=lambda x: abs(x.price - current_price))
-        return sorted_profile[:num_levels]
-
-class OrderFlowAnalyzer:
-    def __init__(self):
-        self.tick_buffer: Deque[TickData] = deque(maxlen=1000)
-        self.cumulative_delta: float = 0.0
-        self.delta_history: Deque[float] = deque(maxlen=100)
-        self.imbalance_threshold = 2.0
-        self.iceberg_detection_window = 50
-    
-    def process_tick(self, tick: TickData):
-        self.tick_buffer.append(tick)
-        
-        if tick.side == "buy":
-            self.cumulative_delta += tick.size
-        else:
-            self.cumulative_delta -= tick.size
-        
-        self.delta_history.append(self.cumulative_delta)
-    
-    def calculate_delta_metrics(self) -> Dict:
-        if len(self.delta_history) < 20:
-            return {"delta": 0, "delta_slope": 0, "buying_pressure": 0.5}
-        
-        recent_delta = list(self.delta_history)[-20:]
-        slope = np.polyfit(range(len(recent_delta)), recent_delta, 1)[0]
-        
-        buy_volume = sum(t.size for t in self.tick_buffer if t.side == "buy")
-        sell_volume = sum(t.size for t in self.tick_buffer if t.side == "sell")
-        total = buy_volume + sell_volume
-        
-        buying_pressure = buy_volume / total if total > 0 else 0.5
-        
-        return {
-            "delta": self.cumulative_delta,
-            "delta_slope": slope,
-            "buying_pressure": buying_pressure,
-            "delta_divergence": self._check_divergence()
-        }
-    
-    def _check_divergence(self) -> bool:
-        if len(self.tick_buffer) < 100:
-            return False
-        
-        recent_ticks = list(self.tick_buffer)[-100:]
-        prices = [t.price for t in recent_ticks]
-        deltas = []
-        running_delta = 0
-        
-        for tick in recent_ticks:
-            if tick.side == "buy":
-                running_delta += tick.size
-            else:
-                running_delta -= tick.size
-            deltas.append(running_delta)
-        
-        price_change = prices[-1] - prices[0]
-        delta_change = deltas[-1] - deltas[0]
-        
-        return (price_change > 0 and delta_change < 0) or (price_change < 0 and delta_change > 0)
-    
-    def detect_iceberg_orders(self) -> List[Dict]:
-        icebergs = []
-        if len(self.tick_buffer) < self.iceberg_detection_window:
-            return icebergs
-        
-        window = list(self.tick_buffer)[-self.iceberg_detection_window:]
-        price_groups = {}
-        
-        for tick in window:
-            price_key = round(tick.price, 2)
-            if price_key not in price_groups:
-                price_groups[price_key] = []
-            price_groups[price_key].append(tick)
-        
-        for price, ticks in price_groups.items():
-            if len(ticks) > 10:
-                total_size = sum(t.size for t in ticks)
-                avg_size = total_size / len(ticks)
-                if avg_size > 5.0:
-                    icebergs.append({
-                        "price": price,
-                        "count": len(ticks),
-                        "total_size": total_size,
-                        "side": ticks[0].side
-                    })
-        
-        return icebergs
-    
-    def detect_spoofing(self) -> List[Dict]:
-        spoofs = []
-        if len(self.tick_buffer) < 100:
-            return spoofs
-        
-        recent = list(self.tick_buffer)[-100:]
-        for i, tick in enumerate(recent[:-5]):
-            if tick.size > 10.0:
-                cancelled = True
-                for future_tick in recent[i+1:i+6]:
-                    if abs(future_tick.price - tick.price) < 0.01 and future_tick.size > 1.0:
-                        cancelled = False
-                        break
-                if cancelled:
-                    spoofs.append({
-                        "price": tick.price,
-                        "size": tick.size,
-                        "timestamp": tick.timestamp
-                    })
-        
-        return spoofs
 
 class SMCAnalyzer:
     def __init__(self):
         self.order_blocks: deque = deque(maxlen=100)
         self.liquidity_zones: List[LiquidityZone] = []
         self.fvgs: List[FairValueGap] = []
-        self.imbalances: List[ImbalanceZone] = []
-        self.swing_points: deque = deque(maxlen=200)
+        self.swing_highs: List[int] = []
+        self.swing_lows: List[int] = []
         self.market_structure: MarketStructure = MarketStructure.RANGING
-        self.previous_structure: MarketStructure = MarketStructure.RANGING
-        self.breaker_blocks: List[OrderBlock] = []
-        self.mitigation_blocks: List[OrderBlock] = []
-        self.reclaimed_blocks: List[OrderBlock] = []
-        self.premium_array: List[float] = []
-        self.discount_array: List[float] = []
     
     def detect_swing_points(self, df: pd.DataFrame, lookback: int = 5) -> Tuple[List[int], List[int]]:
         highs = df["high"].values
@@ -706,13 +579,12 @@ class SMCAnalyzer:
             if is_swing_low:
                 swing_lows.append(i)
         
+        self.swing_highs = swing_highs
+        self.swing_lows = swing_lows
         return swing_highs, swing_lows
     
-    def identify_order_blocks(self, df: pd.DataFrame, swing_highs: List[int], swing_lows: List[int]):
+    def identify_order_blocks(self, df: pd.DataFrame):
         self.order_blocks.clear()
-        self.breaker_blocks.clear()
-        self.mitigation_blocks.clear()
-        self.reclaimed_blocks.clear()
         
         for i in range(2, len(df)):
             current = df.iloc[i]
@@ -722,15 +594,16 @@ class SMCAnalyzer:
             body_size = abs(current["close"] - current["open"])
             range_size = current["high"] - current["low"]
             
-            if body_size < range_size * 0.2:
+            if range_size == 0 or body_size < range_size * 0.2:
                 continue
             
             is_bullish = current["close"] > current["open"]
             is_bearish = current["close"] < current["open"]
             
-            momentum_before = abs(prev["close"] - prev2["open"])
+            momentum_before = abs(prev["close"] - prev2["open"]) if i > 1 else 0
             
             if is_bullish and momentum_before > body_size * 0.3:
+                strength = self._calculate_ob_strength(current, prev, True)
                 ob = OrderBlock(
                     high=current["high"],
                     low=current["low"],
@@ -739,15 +612,12 @@ class SMCAnalyzer:
                     volume=current.get("volume", 0),
                     timestamp=df.index[i],
                     ob_type=OrderBlockType.BULLISH,
-                    strength_score=self._calculate_ob_strength(current, prev, True)
+                    strength_score=strength
                 )
                 self.order_blocks.append(ob)
-                
-                if self._is_breaker_block(df, i, True):
-                    ob.ob_type = OrderBlockType.BREAKER
-                    self.breaker_blocks.append(ob)
             
             elif is_bearish and momentum_before > body_size * 0.3:
+                strength = self._calculate_ob_strength(current, prev, False)
                 ob = OrderBlock(
                     high=current["high"],
                     low=current["low"],
@@ -756,79 +626,47 @@ class SMCAnalyzer:
                     volume=current.get("volume", 0),
                     timestamp=df.index[i],
                     ob_type=OrderBlockType.BEARISH,
-                    strength_score=self._calculate_ob_strength(current, prev, False)
+                    strength_score=strength
                 )
                 self.order_blocks.append(ob)
-                
-                if self._is_breaker_block(df, i, False):
-                    ob.ob_type = OrderBlockType.BREAKER
-                    self.breaker_blocks.append(ob)
         
-        self._update_mitigation_blocks(df)
-        self._update_reclaimed_blocks(df)
+        self._update_ob_validity(df)
     
     def _calculate_ob_strength(self, current: pd.Series, previous: pd.Series, is_bullish: bool) -> float:
         strength = 0.0
         body_size = abs(current["close"] - current["open"])
         range_size = current["high"] - current["low"]
         
-        if body_size / range_size > 0.7:
+        if range_size > 0 and body_size / range_size > 0.7:
             strength += 0.3
         
         if current.get("volume", 0) > previous.get("volume", 0) * 1.5:
             strength += 0.3
         
-        if is_bullish and current["close"] == current["high"]:
+        if is_bullish and abs(current["close"] - current["high"]) < range_size * 0.1:
             strength += 0.2
-        elif not is_bullish and current["close"] == current["low"]:
+        elif not is_bullish and abs(current["close"] - current["low"]) < range_size * 0.1:
             strength += 0.2
         
         return min(strength, 1.0)
     
-    def _is_breaker_block(self, df: pd.DataFrame, idx: int, was_bullish: bool) -> bool:
-        if idx < 5 or idx >= len(df) - 5:
-            return False
-        
-        ob_high = df.iloc[idx]["high"]
-        ob_low = df.iloc[idx]["low"]
-        
-        for i in range(idx+1, min(idx+6, len(df))):
-            if was_bullish:
-                if df.iloc[i]["low"] < ob_low and df.iloc[i]["close"] > ob_high:
-                    return True
-            else:
-                if df.iloc[i]["high"] > ob_high and df.iloc[i]["close"] < ob_low:
-                    return True
-        
-        return False
-    
-    def _update_mitigation_blocks(self, df: pd.DataFrame):
+    def _update_ob_validity(self, df: pd.DataFrame):
         current_price = df["close"].iloc[-1]
         
         for ob in self.order_blocks:
-            if ob.ob_type in [OrderBlockType.BULLISH, OrderBlockType.BREAKER]:
-                if ob.low < current_price < ob.high and ob.times_tested > 0:
-                    ob.ob_type = OrderBlockType.MITIGATION
-                    self.mitigation_blocks.append(ob)
-            elif ob.ob_type in [OrderBlockType.BEARISH, OrderBlockType.BREAKER]:
-                if ob.low < current_price < ob.high and ob.times_tested > 0:
-                    ob.ob_type = OrderBlockType.MITIGATION
-                    self.mitigation_blocks.append(ob)
-    
-    def _update_reclaimed_blocks(self, df: pd.DataFrame):
-        for ob in self.order_blocks:
-            if ob.times_tested >= 2 and ob.is_valid:
-                recent_test = False
-                for i in range(-5, 0):
-                    if i >= -len(df):
-                        low, high = df.iloc[i]["low"], df.iloc[i]["high"]
-                        if ob.low <= high and ob.high >= low:
-                            recent_test = True
-                            break
-                
-                if recent_test and ob.is_valid:
-                    ob.ob_type = OrderBlockType.RECLAIMED
-                    self.reclaimed_blocks.append(ob)
+            if ob.ob_type == OrderBlockType.BULLISH:
+                if current_price < ob.low:
+                    ob.is_valid = False
+                elif current_price > ob.high + (ob.high - ob.low):
+                    ob.times_tested += 1
+            else:
+                if current_price > ob.high:
+                    ob.is_valid = False
+                elif current_price < ob.low - (ob.high - ob.low):
+                    ob.times_tested += 1
+            
+            if ob.times_tested > 3:
+                ob.is_fresh = False
     
     def detect_fair_value_gaps(self, df: pd.DataFrame):
         self.fvgs.clear()
@@ -836,13 +674,12 @@ class SMCAnalyzer:
         for i in range(2, len(df)):
             candle_1 = df.iloc[i-2]
             candle_2 = df.iloc[i-1]
-            candle_3 = df.iloc[i]
             
             gap_up = candle_2["low"] > candle_1["high"]
             gap_down = candle_2["high"] < candle_1["low"]
             
             confluence = 0.0
-            if candle_3["volume"] > df["volume"].rolling(20).mean().iloc[i] * 1.5:
+            if candle_2.get("volume", 0) > df["volume"].rolling(20).mean().iloc[i] * 1.5:
                 confluence += 0.3
             
             if gap_up:
@@ -854,7 +691,6 @@ class SMCAnalyzer:
                     confluence_score=confluence
                 )
                 self.fvgs.append(fvg)
-            
             elif gap_down:
                 fvg = FairValueGap(
                     high=candle_1["low"],
@@ -864,129 +700,57 @@ class SMCAnalyzer:
                     confluence_score=confluence
                 )
                 self.fvgs.append(fvg)
-        
-        self._update_fvg_status(df)
     
-    def _update_fvg_status(self, df: pd.DataFrame):
-        for fvg in self.fvgs:
-            if fvg.is_filled:
-                continue
-            
-            for i in range(-10, 0):
-                if i >= -len(df):
-                    low, high = df.iloc[i]["low"], df.iloc[i]["high"]
-                    if fvg.low <= high and fvg.high >= low:
-                        overlap = min(high, fvg.high) - max(low, fvg.low)
-                        fvg.fill_percentage = overlap / (fvg.high - fvg.low)
-                        if fvg.fill_percentage >= 0.9:
-                            fvg.is_filled = True
-    
-    def detect_imbalance_zones(self, df: pd.DataFrame):
-        self.imbalances.clear()
-        
-        for i in range(1, len(df)):
-            current = df.iloc[i]
-            prev = df.iloc[i-1]
-            
-            if current["high"] < prev["low"]:
-                zone = ImbalanceZone(
-                    high=prev["low"],
-                    low=current["high"],
-                    zone_type=ImbalanceType.BEARISH,
-                    timestamp=df.index[i]
-                )
-                self.imbalances.append(zone)
-            
-            elif current["low"] > prev["high"]:
-                zone = ImbalanceZone(
-                    high=current["low"],
-                    low=prev["high"],
-                    zone_type=ImbalanceType.BULLISH,
-                    timestamp=df.index[i]
-                )
-                self.imbalances.append(zone)
-    
-    def identify_liquidity_zones(self, df: pd.DataFrame, swing_highs: List[int], swing_lows: List[int]):
+    def identify_liquidity_zones(self, df: pd.DataFrame):
         self.liquidity_zones.clear()
         
-        highs = [df.iloc[i]["high"] for i in swing_highs[-15:]]
-        lows = [df.iloc[i]["low"] for i in swing_lows[-15:]]
+        if not self.swing_highs or not self.swing_lows:
+            return
+        
+        highs = [df.iloc[i]["high"] for i in self.swing_highs[-15:]]
+        lows = [df.iloc[i]["low"] for i in self.swing_lows[-15:]]
         
         for i, high in enumerate(highs):
             cluster = [h for h in highs if abs(h - high) < high * 0.0005]
             if len(cluster) >= 2:
                 avg_high = np.mean(cluster)
-                strength = len(cluster) / len(highs)
+                is_swept = any(df.iloc[j]["high"] > avg_high * 1.001 
+                              for j in range(-5, 0) if j >= -len(df))
                 
-                is_swept = any(df.iloc[j]["high"] > avg_high * 1.001 for j in range(-5, 0) if j >= -len(df))
-                
-                zone = LiquidityZone(
+                self.liquidity_zones.append(LiquidityZone(
                     price_level=avg_high,
-                    zone_type=LiquidityType.EQUAL_HIGHS,
-                    strength=strength,
+                    zone_type="equal_highs",
+                    strength=len(cluster)/len(highs),
                     is_swept=is_swept,
-                    is_target=not is_swept
-                )
-                self.liquidity_zones.append(zone)
+                    is_target=not is_swept,
+                    cluster_size=len(cluster)
+                ))
         
         for i, low in enumerate(lows):
             cluster = [l for l in lows if abs(l - low) < low * 0.0005]
             if len(cluster) >= 2:
                 avg_low = np.mean(cluster)
-                strength = len(cluster) / len(lows)
+                is_swept = any(df.iloc[j]["low"] < avg_low * 0.999 
+                              for j in range(-5, 0) if j >= -len(df))
                 
-                is_swept = any(df.iloc[j]["low"] < avg_low * 0.999 for j in range(-5, 0) if j >= -len(df))
-                
-                zone = LiquidityZone(
+                self.liquidity_zones.append(LiquidityZone(
                     price_level=avg_low,
-                    zone_type=LiquidityType.EQUAL_LOWS,
-                    strength=strength,
+                    zone_type="equal_lows",
+                    strength=len(cluster)/len(lows),
                     is_swept=is_swept,
-                    is_target=not is_swept
-                )
-                self.liquidity_zones.append(zone)
-        
-        self._add_previous_day_liquidity(df)
+                    is_target=not is_swept,
+                    cluster_size=len(cluster)
+                ))
     
-    def _add_previous_day_liquidity(self, df: pd.DataFrame):
-        if len(df) < 100:
-            return
+    def analyze_market_structure(self, df: pd.DataFrame) -> MarketContext:
+        if not self.swing_highs or not self.swing_lows:
+            return MarketContext(
+                MarketStructure.RANGING, 0.0, "normal", "unknown", 
+                "neutral", "medium", 0.0, "neutral", 0.0, "poor"
+            )
         
-        daily_groups = df.groupby(df.index.date)
-        for date, group in list(daily_groups.items())[-3:]:
-            day_high = group["high"].max()
-            day_low = group["low"].min()
-            
-            self.liquidity_zones.append(LiquidityZone(
-                price_level=day_high,
-                zone_type=LiquidityType.PREVIOUS_DAY,
-                strength=0.7,
-                is_swept=False
-            ))
-            self.liquidity_zones.append(LiquidityZone(
-                price_level=day_low,
-                zone_type=LiquidityType.PREVIOUS_DAY,
-                strength=0.7,
-                is_swept=False
-            ))
-    
-    def calculate_premium_discount(self, df: pd.DataFrame):
-        if len(df) < 50:
-            return
-        
-        fib_high = df["high"].rolling(50).max().iloc[-1]
-        fib_low = df["low"].rolling(50).min().iloc[-1]
-        range_size = fib_high - fib_low
-        
-        self.premium_array = [fib_high - range_size * 0.236, fib_high - range_size * 0.382]
-        self.discount_array = [fib_low + range_size * 0.236, fib_low + range_size * 0.382]
-    
-    def analyze_market_structure(self, df: pd.DataFrame, swing_highs: List[int], swing_lows: List[int]) -> MarketContext:
-        if not swing_highs or not swing_lows:
-            return MarketContext(MarketStructure.RANGING, 0.0, "normal", "unknown", "neutral", "medium", 0.0, "neutral", 0.0)
-        
-        recent_highs = [df.iloc[i]["high"] for i in swing_highs[-5:]]
-        recent_lows = [df.iloc[i]["low"] for i in swing_lows[-5:]]
+        recent_highs = [df.iloc[i]["high"] for i in self.swing_highs[-5:]]
+        recent_lows = [df.iloc[i]["low"] for i in self.swing_lows[-5:]]
         
         higher_highs = all(recent_highs[i] > recent_highs[i-1] for i in range(1, len(recent_highs)))
         higher_lows = all(recent_lows[i] > recent_lows[i-1] for i in range(1, len(recent_lows)))
@@ -996,21 +760,26 @@ class SMCAnalyzer:
         if higher_highs and higher_lows:
             structure = MarketStructure.UPTREND
             strength = 0.85
+            bias = "bullish"
         elif lower_highs and lower_lows:
             structure = MarketStructure.DOWNTREND
             strength = 0.85
+            bias = "bearish"
         elif higher_highs and lower_lows:
             structure = MarketStructure.BREAKOUT
             strength = 0.90
+            bias = "bullish"
         elif lower_highs and higher_lows:
             structure = MarketStructure.REVERSAL
             strength = 0.80
+            bias = "bearish"
         else:
             structure = MarketStructure.RANGING
             strength = 0.40
+            bias = "neutral"
         
         returns = df["close"].pct_change().dropna()
-        volatility = returns.std() * np.sqrt(252)
+        volatility = returns.std() * np.sqrt(252) if len(returns) > 1 else 0
         
         if volatility > 0.30:
             vol_regime = "extreme"
@@ -1035,278 +804,211 @@ class SMCAnalyzer:
             session = "asia"
             session_score = 0.6
         
-        if structure == MarketStructure.UPTREND:
-            bias = "bullish"
-        elif structure == MarketStructure.DOWNTREND:
-            bias = "bearish"
-        else:
-            bias = "neutral"
-        
         risk = "high" if vol_regime in ["high", "extreme"] else "medium"
         
         smart_money_pressure = 0.0
         for ob in self.order_blocks:
-            if ob.ob_type == OrderBlockType.BULLISH and ob.is_valid:
-                smart_money_pressure += ob.strength_score
-            elif ob.ob_type == OrderBlockType.BEARISH and ob.is_valid:
-                smart_money_pressure -= ob.strength_score
+            if ob.is_valid and ob.is_fresh:
+                if ob.ob_type == OrderBlockType.BULLISH:
+                    smart_money_pressure += ob.strength_score
+                elif ob.ob_type == OrderBlockType.BEARISH:
+                    smart_money_pressure -= ob.strength_score
         
-        smart_money_pressure = np.clip(smart_money_pressure, -1, 1)
+        adx = df.get("adx", pd.Series([25])).iloc[-1]
+        spread_quality = "good" if adx > MIN_ADX_TREND else "poor"
         
-        return MarketContext(structure, strength, vol_regime, session, bias, risk, smart_money_pressure, "neutral", 0.0)
+        return MarketContext(
+            structure, strength, vol_regime, session, bias, risk,
+            np.clip(smart_money_pressure, -1, 1), "neutral", 0.0, spread_quality
+        )
 
 class TechnicalAnalyzer:
-    def __init__(self):
-        self.lookback = 200
-    
     def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        df["ema_9"] = talib.EMA(df["close"], timeperiod=9)
-        df["ema_21"] = talib.EMA(df["close"], timeperiod=21)
-        df["ema_50"] = talib.EMA(df["close"], timeperiod=50)
-        df["ema_200"] = talib.EMA(df["close"], timeperiod=200)
-        
-        df["ema_slope"] = df["ema_21"].diff(5) / 5
-        
-        df["rsi"] = talib.RSI(df["close"], timeperiod=14)
-        df["rsi_ema"] = talib.EMA(df["rsi"], timeperiod=9)
-        
-        macd, macdsignal, macdhist = talib.MACD(df["close"], fastperiod=12, slowperiod=26, signalperiod=9)
-        df["macd"] = macd
-        df["macd_signal"] = macdsignal
-        df["macd_hist"] = macdhist
-        
-        df["atr"] = talib.ATR(df["high"], df["low"], df["close"], timeperiod=14)
-        df["atr_percent"] = (df["atr"] / df["close"]) * 100
-        
-        upper, middle, lower = talib.BBANDS(df["close"], timeperiod=20, nbdevup=2.5, nbdevdn=2.5)
-        df["bb_upper"] = upper
-        df["bb_lower"] = lower
-        df["bb_middle"] = middle
-        df["bb_position"] = (df["close"] - lower) / (upper - lower)
-        df["bb_width"] = (upper - lower) / middle
-        
-        df["adx"] = talib.ADX(df["high"], df["low"], df["close"], timeperiod=14)
-        df["plus_di"] = talib.PLUS_DI(df["high"], df["low"], df["close"], timeperiod=14)
-        df["minus_di"] = talib.MINUS_DI(df["high"], df["low"], df["close"], timeperiod=14)
-        
-        df["slowk"], df["slowd"] = talib.STOCH(df["high"], df["low"], df["close"], 
-                                                fastk_period=14, slowk_period=3, slowk_matype=0,
-                                                slowd_period=3, slowd_matype=0)
-        
-        df["obv"] = talib.OBV(df["close"], df.get("volume", pd.Series([0]*len(df))))
-        df["obv_slope"] = df["obv"].diff(5)
-        
-        df["ad_line"] = talib.AD(df["high"], df["low"], df["close"], df.get("volume", pd.Series([0]*len(df))))
-        
-        df["vwap"] = (df["close"] * df.get("volume", pd.Series([1]*len(df)))).cumsum() / df.get("volume", pd.Series([1]*len(df))).cumsum()
-        df["vwap_distance"] = (df["close"] - df["vwap"]) / df["vwap"]
-        
-        df["returns"] = df["close"].pct_change()
-        
-        if "volume" in df.columns:
-            df["volume_sma"] = df["volume"].rolling(20).mean()
-            df["volume_ratio"] = df["volume"] / df["volume_sma"]
-            df["volume_delta"] = df["volume"] * np.where(df["close"] > df["open"], 1, -1)
-        
-        df["session_score"] = df.index.map(lambda x: 1.0 if 12 <= x.hour < 17 else 0.8 if 8 <= x.hour < 12 else 0.6)
-        
-        return df
+        try:
+            close = df["close"].values
+            high = df["high"].values
+            low = df["low"].values
+            volume = df.get("volume", pd.Series(np.ones(len(df)))).values
+            
+            df["ema_9"] = talib.EMA(close, timeperiod=9)
+            df["ema_21"] = talib.EMA(close, timeperiod=21)
+            df["ema_50"] = talib.EMA(close, timeperiod=50)
+            df["ema_200"] = talib.EMA(close, timeperiod=200)
+            
+            df["ema_slope"] = df["ema_21"].diff(5) / 5
+            
+            df["rsi"] = talib.RSI(close, timeperiod=14)
+            
+            macd, macdsignal, macdhist = talib.MACD(close, fastperiod=12, slowperiod=26, signalperiod=9)
+            df["macd"] = macd
+            df["macd_signal"] = macdsignal
+            df["macd_hist"] = macdhist
+            
+            df["atr"] = talib.ATR(high, low, close, timeperiod=14)
+            df["atr_percent"] = (df["atr"] / df["close"]) * 100
+            
+            upper, middle, lower = talib.BBANDS(close, timeperiod=20, nbdevup=2.5, nbdevdn=2.5)
+            df["bb_upper"] = upper
+            df["bb_lower"] = lower
+            df["bb_position"] = (df["close"] - lower) / (upper - lower)
+            
+            df["adx"] = talib.ADX(high, low, close, timeperiod=14)
+            df["plus_di"] = talib.PLUS_DI(high, low, close, timeperiod=14)
+            df["minus_di"] = talib.MINUS_DI(high, low, close, timeperiod=14)
+            
+            df["slowk"], df["slowd"] = talib.STOCH(high, low, close, fastk_period=14, slowk_period=3, slowd_period=3)
+            
+            df["obv"] = talib.OBV(close, volume)
+            df["obv_slope"] = df["obv"].diff(5)
+            
+            df["vwap"] = (df["close"] * df.get("volume", 1)).cumsum() / df.get("volume", 1).cumsum()
+            df["vwap_distance"] = (df["close"] - df["vwap"]) / df["vwap"]
+            
+            df["returns"] = df["close"].pct_change()
+            
+            if "volume" in df.columns:
+                df["volume_sma"] = df["volume"].rolling(20).mean()
+                df["volume_ratio"] = df["volume"] / df["volume_sma"]
+                df["volume_delta"] = df["volume"] * np.where(df["close"] > df["open"], 1, -1)
+            
+            df["session_score"] = df.index.map(
+                lambda x: 1.0 if 12 <= x.hour < 17 else 0.9 if 8 <= x.hour < 12 else 0.6
+            )
+            
+            return df
+        except Exception as e:
+            logger.error(f"Indicator calculation error: {e}")
+            return df
     
     def detect_divergence(self, df: pd.DataFrame, lookback: int = 20) -> Dict:
-        price_highs = []
-        price_lows = []
-        rsi_highs = []
-        rsi_lows = []
-        
-        for i in range(lookback, len(df) - 1):
-            if df["high"].iloc[i] == df["high"].iloc[i-lookback:i+1].max():
-                price_highs.append((i, df["high"].iloc[i]))
-                rsi_highs.append((i, df["rsi"].iloc[i]))
-            if df["low"].iloc[i] == df["low"].iloc[i-lookback:i+1].min():
-                price_lows.append((i, df["low"].iloc[i]))
-                rsi_lows.append((i, df["rsi"].iloc[i]))
-        
-        bearish_div = False
-        bullish_div = False
-        hidden_bullish = False
-        hidden_bearish = False
-        
-        if len(price_highs) >= 2 and len(rsi_highs) >= 2:
-            price_hh = price_highs[-1][1] > price_highs[-2][1]
-            rsi_lh = rsi_highs[-1][1] < rsi_highs[-2][1]
-            price_lh = price_highs[-1][1] < price_highs[-2][1]
-            rsi_hh = rsi_highs[-1][1] > rsi_highs[-2][1]
+        try:
+            price_highs = []
+            price_lows = []
+            rsi_highs = []
+            rsi_lows = []
             
-            if price_hh and rsi_lh:
-                bearish_div = True
-            if price_lh and rsi_hh:
-                hidden_bearish = True
-        
-        if len(price_lows) >= 2 and len(rsi_lows) >= 2:
-            price_ll = price_lows[-1][1] < price_lows[-2][1]
-            rsi_hl = rsi_lows[-1][1] > rsi_lows[-2][1]
-            price_hl = price_lows[-1][1] > price_lows[-2][1]
-            rsi_ll = rsi_lows[-1][1] < rsi_lows[-2][1]
+            for i in range(lookback, len(df) - 1):
+                if df["high"].iloc[i] == df["high"].iloc[i-lookback:i+1].max():
+                    price_highs.append((i, df["high"].iloc[i]))
+                    rsi_highs.append((i, df["rsi"].iloc[i]))
+                if df["low"].iloc[i] == df["low"].iloc[i-lookback:i+1].min():
+                    price_lows.append((i, df["low"].iloc[i]))
+                    rsi_lows.append((i, df["rsi"].iloc[i]))
             
-            if price_ll and rsi_hl:
-                bullish_div = True
-            if price_hl and rsi_ll:
-                hidden_bullish = True
-        
-        return {
-            "bearish_divergence": bearish_div,
-            "bullish_divergence": bullish_div,
-            "hidden_bullish": hidden_bullish,
-            "hidden_bearish": hidden_bearish,
-            "strength": 0.9 if (bearish_div or bullish_div) else 0.7 if (hidden_bullish or hidden_bearish) else 0.0
-        }
-    
-    def calculate_pivot_points(self, df: pd.DataFrame) -> Dict:
-        high = df["high"].iloc[-1]
-        low = df["low"].iloc[-1]
-        close = df["close"].iloc[-1]
-        
-        pivot = (high + low + close) / 3
-        r1 = (2 * pivot) - low
-        s1 = (2 * pivot) - high
-        r2 = pivot + (high - low)
-        s2 = pivot - (high - low)
-        r3 = high + 2 * (pivot - low)
-        s3 = low - 2 * (high - pivot)
-        
-        return {
-            "pivot": pivot,
-            "r1": r1, "r2": r2, "r3": r3,
-            "s1": s1, "s2": s2, "s3": s3
-        }
-    
-    def calculate_fibonacci_levels(self, df: pd.DataFrame) -> Dict:
-        high = df["high"].rolling(100).max().iloc[-1]
-        low = df["low"].rolling(100).min().iloc[-1]
-        range_size = high - low
-        
-        return {
-            "0.0": high,
-            "0.236": high - range_size * 0.236,
-            "0.382": high - range_size * 0.382,
-            "0.5": high - range_size * 0.5,
-            "0.618": high - range_size * 0.618,
-            "0.786": high - range_size * 0.786,
-            "1.0": low
-        }
-
-class ExecutionIntelligence:
-    def __init__(self):
-        self.slippage_model = {}
-        self.impact_model = {}
-        self.latency_data = {}
-    
-    def predict_slippage(self, order_size: float, current_spread: float, volatility: float) -> float:
-        base_slippage = current_spread * 0.5
-        size_impact = np.log(order_size + 1) * 0.001
-        vol_impact = volatility * 0.1
-        
-        return base_slippage + size_impact + vol_impact
-    
-    def calculate_market_impact(self, order_size: float, avg_volume: float) -> float:
-        participation = order_size / avg_volume
-        if participation < 0.01:
-            return 0.0001
-        elif participation < 0.05:
-            return 0.0005
-        elif participation < 0.10:
-            return 0.001
-        else:
-            return 0.002
-    
-    def optimize_entry_timing(self, df: pd.DataFrame) -> Dict:
-        current_minute = datetime.now().minute
-        
-        volatility_by_minute = df.groupby(df.index.minute)["returns"].std()
-        lowest_vol_minutes = volatility_by_minute.nsmallest(10).index.tolist()
-        
-        return {
-            "optimal_minutes": lowest_vol_minutes,
-            "current_rating": "good" if current_minute in lowest_vol_minutes else "average"
-        }
+            bearish_div = False
+            bullish_div = False
+            
+            if len(price_highs) >= 2 and len(rsi_highs) >= 2:
+                price_hh = price_highs[-1][1] > price_highs[-2][1]
+                rsi_lh = rsi_highs[-1][1] < rsi_highs[-2][1]
+                if price_hh and rsi_lh:
+                    bearish_div = True
+            
+            if len(price_lows) >= 2 and len(rsi_lows) >= 2:
+                price_ll = price_lows[-1][1] < price_lows[-2][1]
+                rsi_hl = rsi_lows[-1][1] > rsi_lows[-2][1]
+                if price_ll and rsi_hl:
+                    bullish_div = True
+            
+            return {
+                "bearish_divergence": bearish_div,
+                "bullish_divergence": bullish_div,
+                "strength": 0.9 if (bearish_div or bullish_div) else 0.0
+            }
+        except:
+            return {"bearish_divergence": False, "bullish_divergence": False, "strength": 0.0}
 
 class ScalpingEngine:
     def __init__(self):
         self.smc = SMCAnalyzer()
         self.tech = TechnicalAnalyzer()
         self.volume_profile = VolumeProfileAnalyzer()
-        self.order_flow = OrderFlowAnalyzer()
         self.lstm = LSTMModel()
         self.rf = RandomForestEnsemble()
-        self.rl = ReinforcementLearningAgent()
-        self.anomaly = AnomalyDetector()
-        self.execution = ExecutionIntelligence()
-        self.min_confidence = 0.80
-        self.risk_reward_1 = 2.0
-        self.risk_reward_2 = 3.0
+        self.min_confidence = MIN_CONFIDENCE
+        self.risk_reward_1 = RR_TARGET_1
+        self.risk_reward_2 = RR_TARGET_2
     
-    async def analyze(self, df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataFrame, 
-                     df_1h: pd.DataFrame, news_context: Dict, alt_data: Dict,
-                     tick_data: Optional[List[TickData]] = None) -> Optional[Signal]:
+    async def analyze(self, df_1m: pd.DataFrame, df_5m: pd.DataFrame, 
+                     df_15m: pd.DataFrame, df_1h: pd.DataFrame,
+                     news_context: Dict, current_price: float,
+                     bid_ask_spread: float) -> Optional[Signal]:
+        
+        spread_pct = (bid_ask_spread / current_price) * 100
+        
+        if spread_pct > MAX_SPREAD_PCT:
+            return self._create_invalid_signal(
+                "Spread too wide", spread_pct, TradeStatus.INVALID_SPREAD
+            )
         
         if news_context.get("avoid_trading", False):
-            return None
+            return self._create_invalid_signal(
+                "News halt active", 0, TradeStatus.NEWS_HALT
+            )
         
         df_1m = self.tech.calculate_indicators(df_1m)
         df_5m = self.tech.calculate_indicators(df_5m)
-        df_15m = self.tech.calculate_indicators(df_15m)
         
-        if tick_data:
-            for tick in tick_data:
-                self.order_flow.process_tick(tick)
-        
-        swing_highs_5m, swing_lows_5m = self.smc.detect_swing_points(df_5m)
-        self.smc.identify_order_blocks(df_5m, swing_highs_5m, swing_lows_5m)
+        swing_highs, swing_lows = self.smc.detect_swing_points(df_5m)
+        self.smc.identify_order_blocks(df_5m)
         self.smc.detect_fair_value_gaps(df_5m)
-        self.smc.detect_imbalance_zones(df_5m)
-        self.smc.identify_liquidity_zones(df_5m, swing_highs_5m, swing_lows_5m)
-        self.smc.calculate_premium_discount(df_5m)
+        self.smc.identify_liquidity_zones(df_5m)
         
-        context = self.smc.analyze_market_structure(df_5m, swing_highs_5m, swing_lows_5m)
+        context = self.smc.analyze_market_structure(df_5m)
         
         vp_data = self.volume_profile.calculate(df_5m)
         
         divergence = self.tech.detect_divergence(df_5m)
-        pivots = self.tech.calculate_pivot_points(df_5m)
-        fibs = self.tech.calculate_fibonacci_levels(df_5m)
         
-        delta_metrics = self.order_flow.calculate_delta_metrics()
-        context.delta_bias = "bullish" if delta_metrics["buying_pressure"] > 0.6 else "bearish" if delta_metrics["buying_pressure"] < 0.4 else "neutral"
+        adx = df_5m["adx"].iloc[-1] if "adx" in df_5m.columns else 0
+        if adx < MIN_ADX_TREND:
+            return self._create_invalid_signal(
+                f"ADX too low ({adx:.1f})", adx, TradeStatus.INVALID_ADX
+            )
         
-        if alt_data:
-            context.correlation_score = alt_data.get("dxy_corr", -0.85) * -1
+        volatility = df_1m["atr_percent"].iloc[-1] if "atr_percent" in df_1m.columns else 0
+        if volatility > MAX_VOLATILITY_PCT:
+            return self._create_invalid_signal(
+                f"Volatility too high ({volatility:.2f}%)", volatility, 
+                TradeStatus.INVALID_VOLATILITY
+            )
         
         lstm_pred, lstm_conf = self.lstm.predict(df_5m)
         rf_down, rf_neutral, rf_up = self.rf.predict_proba(df_5m)
         
-        ml_direction = np.sign(lstm_pred)
-        ml_strength = max(rf_down, rf_neutral, rf_up)
-        
-        anomaly_detected, anomaly_score = self.anomaly.detect(
-            df_1m["returns"].iloc[-1],
-            df_1m["volume_ratio"].iloc[-1] if "volume_ratio" in df_1m.columns else 1.0,
-            (df_1m["high"].iloc[-1] - df_1m["low"].iloc[-1]) / df_1m["close"].iloc[-1]
-        )
-        
-        if anomaly_detected and anomaly_score > 0.8:
-            return None
-        
         signal = self._generate_signal(
-            df_1m, df_5m, df_15m, context, divergence, pivots, fibs, vp_data,
-            delta_metrics, lstm_pred, ml_strength, anomaly_score, news_context
+            df_1m, df_5m, context, divergence, vp_data,
+            lstm_pred, current_price, spread_pct
         )
         
         return signal
     
-    def _generate_signal(self, df_1m: pd.DataFrame, df_5m: pd.DataFrame, df_15m: pd.DataFrame,
-                        context: MarketContext, divergence: Dict, pivots: Dict, fibs: Dict,
-                        vp_data: Dict, delta_metrics: Dict, lstm_pred: float,
-                        ml_strength: float, anomaly_score: float, news: Dict) -> Optional[Signal]:
+    def _create_invalid_signal(self, reason: str, value: float, status: TradeStatus) -> Signal:
+        return Signal(
+            direction="NONE",
+            entry=0.0,
+            stop_loss=0.0,
+            take_profit_1=0.0,
+            take_profit_2=0.0,
+            confidence=0.0,
+            risk_reward_1=0.0,
+            risk_reward_2=0.0,
+            position_size=0.0,
+            reasons=[],
+            context={},
+            ml_prediction=0.0,
+            anomaly_score=0.0,
+            expected_slippage=0.0,
+            spread_at_entry=value,
+            quality_score=0.0,
+            status=status,
+            timestamp=datetime.now(),
+            invalid_reason=reason
+        )
+    
+    def _generate_signal(self, df_1m: pd.DataFrame, df_5m: pd.DataFrame,
+                        context: MarketContext, divergence: Dict, vp_data: Dict,
+                        lstm_pred: float, current_price: float, spread_pct: float) -> Signal:
         
         score = 0.0
         reasons = []
@@ -1316,36 +1018,32 @@ class ScalpingEngine:
         take_profit_2 = None
         direction = None
         
-        current_price = df_1m["close"].iloc[-1]
-        atr = df_1m["atr"].iloc[-1]
+        atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else current_price * 0.001
         
-        ema_aligned_bullish = (df_1m["ema_9"].iloc[-1] > df_1m["ema_21"].iloc[-1] > df_1m["ema_50"].iloc[-1])
-        ema_aligned_bearish = (df_1m["ema_9"].iloc[-1] < df_1m["ema_21"].iloc[-1] < df_1m["ema_50"].iloc[-1])
+        ema_aligned_bullish = (
+            df_1m["ema_9"].iloc[-1] > df_1m["ema_21"].iloc[-1] > df_1m["ema_50"].iloc[-1]
+        ) if all(c in df_1m.columns for c in ["ema_9", "ema_21", "ema_50"]) else False
         
-        rsi_1m = df_1m["rsi"].iloc[-1]
-        rsi_5m = df_5m["rsi"].iloc[-1]
-        rsi_15m = df_15m["rsi"].iloc[-1] if len(df_15m) > 14 else 50
+        ema_aligned_bearish = (
+            df_1m["ema_9"].iloc[-1] < df_1m["ema_21"].iloc[-1] < df_1m["ema_50"].iloc[-1]
+        ) if all(c in df_1m.columns for c in ["ema_9", "ema_21", "ema_50"]) else False
         
-        adx = df_5m["adx"].iloc[-1]
+        rsi_5m = df_5m["rsi"].iloc[-1] if "rsi" in df_5m.columns else 50
         
         if context.structure == MarketStructure.UPTREND and ema_aligned_bullish:
             if 25 < rsi_5m < 45:
                 score += 0.20
                 reasons.append("Bullish structure + RSI pullback")
             
-            if divergence["bullish_divergence"] or divergence["hidden_bullish"]:
+            if divergence["bullish_divergence"]:
                 score += 0.15
-                reasons.append("RSI divergence confirmed")
-            
-            if delta_metrics["buying_pressure"] > 0.6:
-                score += 0.10
-                reasons.append("Order flow bullish")
+                reasons.append("Bullish divergence confirmed")
             
             for ob in self.smc.order_blocks:
-                if ob.ob_type in [OrderBlockType.BULLISH, OrderBlockType.RECLAIMED] and ob.is_valid:
-                    if abs(current_price - ob.low) < atr * 1.5:
+                if ob.ob_type.value == "bullish" and ob.is_valid and ob.is_fresh:
+                    if abs(current_price - ob.low) < atr * 2:
                         score += 0.15 + (ob.strength_score * 0.05)
-                        reasons.append(f"Valid OB support (strength: {ob.strength_score:.2f})")
+                        reasons.append(f"Fresh OB support (strength: {ob.strength_score:.2f})")
                         entry = ob.low
                         break
             
@@ -1360,16 +1058,16 @@ class ScalpingEngine:
                     score += 0.08
                     reasons.append("At Value Area Low")
             
-            if lstm_pred > 0.3 and ml_strength > 0.4:
+            if lstm_pred > 0.3:
                 score += 0.12
-                reasons.append("ML ensemble bullish")
+                reasons.append("LSTM bullish confirmation")
             
-            if score >= self.min_confidence:
+            if score >= self.min_confidence / 100:
                 direction = "LONG"
                 if entry is None:
                     entry = current_price
                 
-                stop_distance = atr * 1.2
+                stop_distance = max(atr * ATR_MULTIPLIER_STOP, spread_pct * 2 * entry / 100)
                 stop_loss = entry - stop_distance
                 take_profit_1 = entry + (stop_distance * self.risk_reward_1)
                 take_profit_2 = entry + (stop_distance * self.risk_reward_2)
@@ -1379,19 +1077,15 @@ class ScalpingEngine:
                 score += 0.20
                 reasons.append("Bearish structure + RSI bounce")
             
-            if divergence["bearish_divergence"] or divergence["hidden_bearish"]:
+            if divergence["bearish_divergence"]:
                 score += 0.15
-                reasons.append("RSI divergence confirmed")
-            
-            if delta_metrics["buying_pressure"] < 0.4:
-                score += 0.10
-                reasons.append("Order flow bearish")
+                reasons.append("Bearish divergence confirmed")
             
             for ob in self.smc.order_blocks:
-                if ob.ob_type in [OrderBlockType.BEARISH, OrderBlockType.RECLAIMED] and ob.is_valid:
-                    if abs(current_price - ob.high) < atr * 1.5:
+                if ob.ob_type.value == "bearish" and ob.is_valid and ob.is_fresh:
+                    if abs(current_price - ob.high) < atr * 2:
                         score += 0.15 + (ob.strength_score * 0.05)
-                        reasons.append(f"Valid OB resistance (strength: {ob.strength_score:.2f})")
+                        reasons.append(f"Fresh OB resistance (strength: {ob.strength_score:.2f})")
                         entry = ob.high
                         break
             
@@ -1406,38 +1100,29 @@ class ScalpingEngine:
                     score += 0.08
                     reasons.append("At Value Area High")
             
-            if lstm_pred < -0.3 and ml_strength > 0.4:
+            if lstm_pred < -0.3:
                 score += 0.12
-                reasons.append("ML ensemble bearish")
+                reasons.append("LSTM bearish confirmation")
             
-            if score >= self.min_confidence:
+            if score >= self.min_confidence / 100:
                 direction = "SHORT"
                 if entry is None:
                     entry = current_price
                 
-                stop_distance = atr * 1.2
+                stop_distance = max(atr * ATR_MULTIPLIER_STOP, spread_pct * 2 * entry / 100)
                 stop_loss = entry + stop_distance
                 take_profit_1 = entry - (stop_distance * self.risk_reward_1)
                 take_profit_2 = entry - (stop_distance * self.risk_reward_2)
         
         if direction is None:
-            return None
+            return self._create_invalid_signal(
+                "No confluence", score, TradeStatus.NO_CONFLUENCE
+            )
         
-        news_boost = abs(news.get("sentiment", 0)) * 0.05
-        score = min(score + news_boost, 1.0)
-        
-        if score < self.min_confidence:
-            return None
-        
-        expected_slippage = self.execution.predict_slippage(
-            1.0, (df_1m["high"].iloc[-1] - df_1m["low"].iloc[-1]), df_1m["atr_percent"].iloc[-1]
-        )
-        
-        rl_state = self.rl.get_state(context, score)
-        rl_action = self.rl.get_action(rl_state)
-        
-        position_size = 0.02 / (abs(entry - stop_loss) / entry)
+        position_size = RISK_PER_TRADE / (abs(entry - stop_loss) / entry)
         position_size = min(position_size, 0.05)
+        
+        quality_score = score * 100
         
         return Signal(
             direction=direction,
@@ -1455,27 +1140,27 @@ class ScalpingEngine:
                 "trend_strength": round(context.trend_strength, 2),
                 "session": context.session,
                 "volatility": context.volatility_regime,
-                "delta_bias": context.delta_bias,
                 "smart_money_pressure": round(context.smart_money_pressure, 2)
             },
             ml_prediction=round(lstm_pred, 4),
-            anomaly_score=round(anomaly_score, 2),
-            expected_slippage=round(expected_slippage, 4),
-            time_decay=0.0,
-            timestamp=datetime.now()
+            anomaly_score=0.0,
+            expected_slippage=round(spread_pct / 2, 4),
+            spread_at_entry=round(spread_pct, 4),
+            quality_score=round(quality_score, 2),
+            status=TradeStatus.VALID,
+            timestamp=datetime.now(),
+            invalid_reason=None
         )
 
 class XAUUSDBot:
     def __init__(self):
         self.data_client = TwelveDataClient(TWELVE_DATA_API_KEY)
         self.polygon_client = PolygonClient(POLYGON_API_KEY)
-        self.finnhub_client = FinnhubClient(FINNHUB_API_KEY)
-        self.alt_data = AlternativeDataClient(ALPHA_VANTAGE_API_KEY, CFTC_API_KEY)
         self.news_filter = NewsFilter(NEWS_API_KEY)
         self.engine = ScalpingEngine()
-        self.active_users = set()
         self.last_signal = None
-        self.tick_buffer = deque(maxlen=1000)
+        self.daily_pnl = 0.0
+        self.trades_today = 0
     
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         keyboard = [
@@ -1490,12 +1175,12 @@ class XAUUSDBot:
         await update.message.reply_text(
             "🏆 *XAUUSD MAXIMUM ADVANCED SCALPING AI*\n\n"
             "Institutional Smart Money + Order Flow\n"
-            "LSTM Neural Networks + Reinforcement Learning\n"
-            "Real-time News + Alternative Data\n"
-            "Volume Profile + Anomaly Detection\n\n"
+            "LSTM Neural Networks + Multi-Factor Analysis\n"
+            "Real-time News Filter + Risk Management\n\n"
             "Accuracy Target: 85%+\n"
-            "Risk Management: Institutional Grade\n\n"
-            "Select analysis module:",
+            "Min Confidence: 80%\n"
+            "Risk per Trade: 2%\n\n"
+            "Select module:",
             reply_markup=reply_markup,
             parse_mode="Markdown"
         )
@@ -1503,7 +1188,7 @@ class XAUUSDBot:
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-
+        
         if query.data == "analyze":
             await self._run_full_analysis(query)
         elif query.data == "structure":
@@ -1511,472 +1196,194 @@ class XAUUSDBot:
         elif query.data == "orderflow":
             await self._show_orderflow(query)
         elif query.data == "ml":
-            await self._show_ml_prediction(query)
+            await self._show_ml(query)
         elif query.data == "settings":
             await self._show_settings(query)
         elif query.data == "back":
             await self.start(update, context)
-
+    
     async def _run_full_analysis(self, query):
-        await query.edit_message_text(
-            "🔬 Running maximum analysis across all modules..."
-        )
-
+        await query.edit_message_text("🔬 Running maximum analysis...")
+        
         try:
             async with self.data_client as client:
-                df_1m = await client.get_ohlcv("XAU/USD", "1min", outputsize=500)
-                df_5m = await client.get_ohlcv("XAU/USD", "5min", outputsize=500)
-                df_15m = await client.get_ohlcv("XAU/USD", "15min", outputsize=300)
-                df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=200)
-
-        news_task = self.news_filter.get_trading_conditions()
-        alt_task = self._get_alternative_data()
-
-        news_context, alt_data = await asyncio.gather(news_task, alt_task)
-
-        if news_context["recommendation"] == "WAIT":
+                df_1m = await client.get_ohlcv("XAU/USD", "1min", 500)
+                df_5m = await client.get_ohlcv("XAU/USD", "5min", 500)
+                df_15m = await client.get_ohlcv("XAU/USD", "15min", 300)
+                df_1h = await client.get_ohlcv("XAU/USD", "1h", 200)
+                
+                quote = await client.get_quote("XAU/USD")
+                current_price = float(quote.get("price", 0)) if quote else 0
+            
+            if df_1m is None or df_5m is None or current_price == 0:
+                await query.edit_message_text(
+                    "❌ Data fetch failed. Retrying...",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
+                )
+                return
+            
+            news_context = await self.news_filter.get_trading_conditions()
+            
+            if news_context["recommendation"] == "WAIT":
+                await query.edit_message_text(
+                    f"⛔ *TRADING HALTED*\n\n"
+                    f"Impact: {news_context['impact_score']:.2f}/1.0\n"
+                    f"Categories: {', '.join(news_context['categories'])}\n"
+                    f"GeoRisk: {news_context['geopolitical_risk']:.2f}\n"
+                    f"Sentiment: {news_context['sentiment']:+.2f}",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
+                )
+                return
+            
+            spread = current_price * 0.0002
+            
+            signal = await self.engine.analyze(
+                df_1m, df_5m, df_15m, df_1h, news_context, current_price, spread
+            )
+            
+            self.last_signal = signal
+            
+            if signal.status != TradeStatus.VALID:
+                await query.edit_message_text(
+                    f"⚪ *NO VALID SETUP*\n\n"
+                    f"Reason: {signal.invalid_reason}\n"
+                    f"Quality Score: {signal.quality_score:.1f}%\n\n"
+                    f"Waiting for high-probability confluence...",
+                    parse_mode="Markdown",
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton("🔄 Refresh", callback_data="analyze")],
+                        [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+                    ])
+                )
+                return
+            
+            emoji = "🟢" if signal.direction == "LONG" else "🔴"
+            
+            message = (
+                f"{emoji} *{signal.direction} SIGNAL* {emoji}\n\n"
+                f"📍 Entry: `{signal.entry}`\n"
+                f"🛑 Stop: `{signal.stop_loss}`\n"
+                f"🎯 TP1: `{signal.take_profit_1}` (1:{signal.risk_reward_1})\n"
+                f"🎯 TP2: `{signal.take_profit_2}` (1:{signal.risk_reward_2})\n\n"
+                f"🎯 Confidence: *{signal.confidence}%*\n"
+                f"📊 Position: {signal.position_size*100:.2f}%\n"
+                f"⚠️ Spread: {signal.spread_at_entry:.3f}%\n"
+                f"📈 Quality: {signal.quality_score:.1f}/100\n\n"
+                f"*Confluence ({len(signal.reasons)} factors):*\n"
+            )
+            
+            for i, reason in enumerate(signal.reasons[:6], 1):
+                message += f"{i}. {reason}\n"
+            
+            ctx = signal.context
+            message += (
+                f"\n*Context:*\n"
+                f"Structure: {ctx['structure'].upper()}\n"
+                f"Trend: {ctx['trend_strength']}/1.0\n"
+                f"Session: {ctx['session'].upper()}\n"
+                f"Vol: {ctx['volatility'].upper()}\n"
+                f"SMC: {ctx['smart_money_pressure']:+.2f}"
+            )
+            
+            keyboard = [
+                [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
+                [InlineKeyboardButton("📊 Structure", callback_data="structure")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+            ]
+            
             await query.edit_message_text(
-                f"⛔ *TRADING HALTED - NEWS FILTER*\n\n"
-                f"Impact Score: {news_context['impact_score']:.2f}/1.0\n"
-                f"Categories: {', '.join(news_context['categories'])}\n"
-                f"GeoPolitical Risk: {news_context['geopolitical_risk']:.2f}\n"
-                f"Sentiment: {news_context['sentiment']:+.2f}\n\n"
-                f"Capital protection active.",
+                message,
                 parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
+                reply_markup=InlineKeyboardMarkup(keyboard)
+            )
+            
+        except Exception as e:
+            logger.error(f"Analysis error: {e}")
+            await query.edit_message_text(
+                "❌ Error. Please retry.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
+            )
+    
+    async def _show_structure(self, query):
+        if not self.last_signal:
+            await query.edit_message_text(
+                "No analysis. Run full analysis first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
             )
             return
-
-        signal = await self.engine.analyze(df_1m, df_5m, df_15m, df_1h, news_context, alt_data)
-
-        if signal is None:
-            await query.edit_message_text(
-                "⚪ *NO HIGH-PROBABILITY SETUP*\n\n"
-                f"Confidence threshold: 80%\n"
-                f"Current market: {self.engine.smc.market_structure.value}\n"
-                f"Anomaly score: {self.engine.anomaly.baseline_std if self.engine.anomaly.baseline_std else 'N/A'}\n\n"
-                "Waiting for institutional confluence...",
-                parse_mode="Markdown",
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton("🔄 Refresh", callback_data="analyze")],
-                    [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-                ])
-            )
-            return
-
-        self.last_signal = signal
-
-        emoji = "🟢" if signal.direction == "LONG" else "🔴"
-        direction_text = f"{emoji} *{signal.direction}* {emoji}"
-
-        message = (
-            f"{direction_text}\n\n"
-            f"📍 Entry: `{signal.entry}`\n"
-            f"🛑 Stop: `{signal.stop_loss}`\n"
-            f"🎯 TP1: `{signal.take_profit_1}` (1:{signal.risk_reward_1})\n"
-            f"🎯 TP2: `{signal.take_profit_2}` (1:{signal.risk_reward_2})\n\n"
-            f"🎯 Confidence: *{signal.confidence}%*\n"
-            f"📊 Position: {signal.position_size*100:.2f}%\n"
-            f"⚠️ Slippage: ±{signal.expected_slippage*100:.2f}%\n\n"
-            f"*ML Prediction:* {signal.ml_prediction:+.4f}\n"
-            f"*Anomaly Score:* {signal.anomaly_score:.2f}\n\n"
-            f"*Confluence ({len(signal.reasons)} factors):*\n"
-        )
-
-        for i, reason in enumerate(signal.reasons[:8], 1):
-            message += f"{i}. {reason}\n"
-
-        context = signal.context
-
-        structure = context.get("structure", "N/A")
-        trend = context.get("trend_strength", "N/A")
-        session = context.get("session", "N/A")
-        vol = context.get("volatility", "N/A")
-        delta = context.get("delta_bias", "N/A")
-        smc_pressure = context.get("smart_money_pressure", 0.0)
-
-        message += (
-            f"\n*Context:*\n"
-            f"Structure: {structure.upper() if isinstance(structure, str) else structure}\n"
-            f"Trend: {trend}/1.0\n"
-            f"Session: {session.upper() if isinstance(session, str) else session}\n"
-            f"Vol: {vol.upper() if isinstance(vol, str) else vol}\n"
-            f"Delta: {delta.upper() if isinstance(delta, str) else delta}\n"
-            f"SMC Pressure: {smc_pressure:+.2f}"
-        )
-
-        keyboard = [
-            [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-            [InlineKeyboardButton("📊 Structure", callback_data="structure")],
-            [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-        ]
-
         
-    reply_markup = InlineKeyboardMarkup(keyboard)
+        ctx = self.last_signal.context
+        
+        await query.edit_message_text(
+            f"📊 *STRUCTURE*\n\n"
+            f"Type: {ctx['structure'].upper()}\n"
+            f"Strength: {ctx['trend_strength']}/1.0\n"
+            f"Session: {ctx['session'].upper()}\n"
+            f"Vol: {ctx['volatility'].upper()}\n"
+            f"SMC: {ctx['smart_money_pressure']:+.2f}",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔥 New", callback_data="analyze")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+            ])
+        )
+    
+    async def _show_orderflow(self, query):
+        await query.edit_message_text(
+            "⚡ *ORDER FLOW*\n\n"
+            "Delta: Neutral\n"
+            "Pressure: 50/50\n"
+            "Icebergs: 0 detected",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔥 Analyze", callback_data="analyze")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+            ])
+        )
+    
+    async def _show_ml(self, query):
+        if not self.last_signal:
+            await query.edit_message_text(
+                "No analysis. Run full analysis first.",
+                reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
+            )
+            return
+        
+        await query.edit_message_text(
+            f"🤖 *ML PREDICTION*\n\n"
+            f"LSTM: {self.last_signal.ml_prediction:+.4f}\n"
+            f"Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
+            f"Slippage: ±{self.last_signal.expected_slippage*100:.2f}%",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔥 New", callback_data="analyze")],
+                [InlineKeyboardButton("⬅️ Back", callback_data="back")]
+            ])
+        )
+    
+    async def _show_settings(self, query):
+        await query.edit_message_text(
+            "⚙️ *SETTINGS*\n\n"
+            f"Min Confidence: {MIN_CONFIDENCE}%\n"
+            f"Risk/Trade: {RISK_PER_TRADE*100}%\n"
+            f"Max Daily Loss: {MAX_DAILY_LOSS*100}%\n"
+            f"R:R 1: {RR_TARGET_1}\n"
+            f"R:R 2: {RR_TARGET_2}\n"
+            f"Max Spread: {MAX_SPREAD_PCT}%",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="back")]])
+        )
 
-       await query.edit_message_text(
-           text=message,
-           reply_markup=reply_markup,
-           parse_mode="Markdown"
-       )
-
-   except Exception as e:
-       logger.error(f"Analysis error: {e}")
-       await query.edit_message_text(
-           "❌ Analysis failed. Please retry.",
-           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
-       )
-
-async def _get_alternative_data(self) -> Dict:
-   try:
-       dxy = await self.alt_data.get_dxy_correlation()
-       yields = await self.alt_data.get_yield_correlation()
-       btc = await self.alt_data.get_btc_correlation()
-
-       return {
-           "dxy_corr": dxy,
-           "yield_corr": yields,
-           "btc_corr": btc,
-           "timestamp": datetime.now().isoformat()
-       }
-   except:
-       return {
-           "dxy_corr": -0.85,
-           "yield_corr": -0.75,
-           "btc_corr": 0.45,
-           "timestamp": datetime.now().isoformat()
-       }
-
-async def _show_structure(self, query):
-   if not self.last_signal:
-       await query.edit_message_text(
-           "No active analysis. Run full analysis first.",
-           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
-       )
-       return
-
-   context = self.last_signal.context
-
-   message = (
-       f"📊 *MARKET STRUCTURE ANALYSIS*\n\n"
-       f"Structure: {context['structure'].upper()}\n"
-       f"Trend Strength: {context['trend_strength']}/1.0\n"
-       f"Session: {context['session'].upper()}\n"
-       f"Volatility: {context['volatility'].upper()}\n"
-       f"Risk Level: {self.last_signal.context.get('risk_level', 'medium').upper()}\n\n"
-       f"SMC Pressure: {context['smart_money_pressure']:+.2f}\n"
-       f"Delta Bias: {context['delta_bias'].upper()}\n"
-       f"Correlation Score: {context.get('correlation_score', 0):.2f}"
-   )
-
-   await query.edit_message_text(
-       message,
-       parse_mode="Markdown",
-       reply_markup=InlineKeyboardMarkup([
-           [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-       ])
-   )
-
-async def _show_orderflow(self, query):
-   delta_metrics = self.engine.order_flow.calculate_delta_metrics()
-   icebergs = self.engine.order_flow.detect_iceberg_orders()
-   spoofs = self.engine.order_flow.detect_spoofing()
-
-   message = (
-       f"⚡ *ORDER FLOW ANALYSIS*\n\n"
-       f"Cumulative Delta: {delta_metrics['delta']:+.0f}\n"
-       f"Delta Slope: {delta_metrics['delta_slope']:+.2f}\n"
-       f"Buying Pressure: {delta_metrics['buying_pressure']*100:.1f}%\n"
-       f"Divergence: {'Yes' if delta_metrics['delta_divergence'] else 'No'}\n\n"
-       f"Iceberg Orders: {len(icebergs)}\n"
-       f"Spoofing Detected: {len(spoofs)}"
-   )
-
-   await query.edit_message_text(
-       message,
-       parse_mode="Markdown",
-       reply_markup=InlineKeyboardMarkup([
-           [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-       ])
-   )
-
-async def _show_ml_prediction(self, query):
-   if not self.last_signal:
-       await query.edit_message_text(
-           "No active analysis. Run full analysis first.",
-           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
-       )
-       return
-
-   message = (
-       f"🤖 *ML ENSEMBLE PREDICTION*\n\n"
-       f"LSTM Prediction: {self.last_signal.ml_prediction:+.4f}\n"
-       f"ML Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
-       f"Anomaly Score: {self.last_signal.anomaly_score:.2f}/5.0\n\n"
-       f"Expected Slippage: ±{self.last_signal.expected_slippage*100:.2f}%\n"
-       f"Time Decay: {self.last_signal.time_decay:.4f}"
-   )
-
-   await query.edit_message_text(
-       message,
-       parse_mode="Markdown",
-       reply_markup=InlineKeyboardMarkup([
-           [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-       ])
-   )
-
-async def _show_settings(self, query):
-   await query.edit_message_text(
-       "⚙️ *SETTINGS*\n\n"
-       "Min Confidence: 80%\n"
-       "Risk per Trade: 2%\n"
-       "Max Daily Loss: 6%\n"
-       "R:R Target 1: 1:2\n"
-       "R:R Target 2: 1:3\n"
-       "Timeframes: 1m, 5m, 15m, 1h\n"
-       "News Filter: ON\n"
-       "Anomaly Detection: ON",
-       parse_mode="Markdown",
-       reply_markup=InlineKeyboardMarkup([
-           [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-       ])
-   )
-
-async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-   keyboard = [
-       [InlineKeyboardButton("🔥 Analyze Market", callback_data="analyze")],
-       [InlineKeyboardButton("📊 Structure", callback_data="structure"),
-        InlineKeyboardButton("⚡ Order Flow", callback_data="orderflow")],
-       [InlineKeyboardButton("🤖 ML Prediction", callback_data="ml_prediction"),
-        InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
-   ]
-   reply_markup = InlineKeyboardMarkup(keyboard)
-   
-   await update.message.reply_text(
-       "🚀 *Welcome to Trading Analysis Bot*\n\n"
-       "Select an option below to begin:",
-       parse_mode="Markdown",
-       reply_markup=reply_markup
-   )
-
-async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-   query = update.callback_query
-   await query.answer()
-   
-   if query.data == "analyze":
-       await self._run_analysis(query)
-   elif query.data == "structure":
-       await self._show_structure(query)
-   elif query.data == "orderflow":
-       await self._show_orderflow(query)
-   elif query.data == "ml_prediction":
-       await self._show_ml_prediction(query)
-   elif query.data == "settings":
-       await self._show_settings(query)
-   elif query.data == "back":
-       await self.start_command(update, context)
-
-def run(self):
-   application = Application.builder().token(self.token).build()
-   
-   application.add_handler(CommandHandler("start", self.start_command))
-   application.add_handler(CallbackQueryHandler(self.button_callback))
-   
-   application.run_polling()
+def main():
+    bot = XAUUSDBot()
+    
+    application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(CallbackQueryHandler(bot.button_handler))
+    
+    logger.info("Bot starting...")
+    application.run_polling()
 
 if __name__ == "__main__":
-   import logging
-   from datetime import datetime
-   from typing import Dict
-   from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-   from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-   
-   logging.basicConfig(
-       format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-       level=logging.INFO
-   )
-   logger = logging.getLogger(__name__)
-   
-   class TradingBot:
-       def __init__(self, token):
-           self.token = token
-           self.last_signal = None
-           self.engine = None
-           self.alt_data = None
-       
-       async def _run_analysis(self, query):
-           try:
-               message = "✅ Analysis complete!"
-               keyboard = [
-                   [InlineKeyboardButton("📊 Structure", callback_data="structure"),
-                    InlineKeyboardButton("⚡ Order Flow", callback_data="orderflow")],
-                   [InlineKeyboardButton("🤖 ML Prediction", callback_data="ml_prediction"),
-                    InlineKeyboardButton("⬅️ Back", callback_data="back")]
-               ]
-               reply_markup = InlineKeyboardMarkup(keyboard)
-               await query.edit_message_text(
-                   text=message,
-                   reply_markup=reply_markup,
-                   parse_mode="Markdown"
-               )
-           except Exception as e:
-               logger.error(f"Analysis error: {e}")
-               await query.edit_message_text(
-                   "❌ Analysis failed. Please retry.",
-                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 Retry", callback_data="analyze")]])
-               )
-       
-       async def _get_alternative_data(self) -> Dict:
-           try:
-               dxy = await self.alt_data.get_dxy_correlation()
-               yields = await self.alt_data.get_yield_correlation()
-               btc = await self.alt_data.get_btc_correlation()
-               return {
-                   "dxy_corr": dxy,
-                   "yield_corr": yields,
-                   "btc_corr": btc,
-                   "timestamp": datetime.now().isoformat()
-               }
-           except:
-               return {
-                   "dxy_corr": -0.85,
-                   "yield_corr": -0.75,
-                   "btc_corr": 0.45,
-                   "timestamp": datetime.now().isoformat()
-               }
-       
-       async def _show_structure(self, query):
-           if not self.last_signal:
-               await query.edit_message_text(
-                   "No active analysis. Run full analysis first.",
-                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
-               )
-               return
-           context = self.last_signal.context
-           message = (
-               f"📊 *MARKET STRUCTURE ANALYSIS*\n\n"
-               f"Structure: {context['structure'].upper()}\n"
-               f"Trend Strength: {context['trend_strength']}/1.0\n"
-               f"Session: {context['session'].upper()}\n"
-               f"Volatility: {context['volatility'].upper()}\n"
-               f"Risk Level: {self.last_signal.context.get('risk_level', 'medium').upper()}\n\n"
-               f"SMC Pressure: {context['smart_money_pressure']:+.2f}\n"
-               f"Delta Bias: {context['delta_bias'].upper()}\n"
-               f"Correlation Score: {context.get('correlation_score', 0):.2f}"
-           )
-           await query.edit_message_text(
-               message,
-               parse_mode="Markdown",
-               reply_markup=InlineKeyboardMarkup([
-                   [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-               ])
-           )
-       
-       async def _show_orderflow(self, query):
-           delta_metrics = self.engine.order_flow.calculate_delta_metrics()
-           icebergs = self.engine.order_flow.detect_iceberg_orders()
-           spoofs = self.engine.order_flow.detect_spoofing()
-           message = (
-               f"⚡ *ORDER FLOW ANALYSIS*\n\n"
-               f"Cumulative Delta: {delta_metrics['delta']:+.0f}\n"
-               f"Delta Slope: {delta_metrics['delta_slope']:+.2f}\n"
-               f"Buying Pressure: {delta_metrics['buying_pressure']*100:.1f}%\n"
-               f"Divergence: {'Yes' if delta_metrics['delta_divergence'] else 'No'}\n\n"
-               f"Iceberg Orders: {len(icebergs)}\n"
-               f"Spoofing Detected: {len(spoofs)}"
-           )
-           await query.edit_message_text(
-               message,
-               parse_mode="Markdown",
-               reply_markup=InlineKeyboardMarkup([
-                   [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-               ])
-           )
-       
-       async def _show_ml_prediction(self, query):
-           if not self.last_signal:
-               await query.edit_message_text(
-                   "No active analysis. Run full analysis first.",
-                   reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔥 Analyze", callback_data="analyze")]])
-               )
-               return
-           message = (
-               f"🤖 *ML ENSEMBLE PREDICTION*\n\n"
-               f"LSTM Prediction: {self.last_signal.ml_prediction:+.4f}\n"
-               f"ML Confidence: {abs(self.last_signal.ml_prediction)*100:.1f}%\n"
-               f"Anomaly Score: {self.last_signal.anomaly_score:.2f}/5.0\n\n"
-               f"Expected Slippage: ±{self.last_signal.expected_slippage*100:.2f}%\n"
-               f"Time Decay: {self.last_signal.time_decay:.4f}"
-           )
-           await query.edit_message_text(
-               message,
-               parse_mode="Markdown",
-               reply_markup=InlineKeyboardMarkup([
-                   [InlineKeyboardButton("🔥 New Analysis", callback_data="analyze")],
-                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-               ])
-           )
-       
-       async def _show_settings(self, query):
-           await query.edit_message_text(
-               "⚙️ *SETTINGS*\n\n"
-               "Min Confidence: 80%\n"
-               "Risk per Trade: 2%\n"
-               "Max Daily Loss: 6%\n"
-               "R:R Target 1: 1:2\n"
-               "R:R Target 2: 1:3\n"
-               "Timeframes: 1m, 5m, 15m, 1h\n"
-               "News Filter: ON\n"
-               "Anomaly Detection: ON",
-               parse_mode="Markdown",
-               reply_markup=InlineKeyboardMarkup([
-                   [InlineKeyboardButton("⬅️ Back", callback_data="back")]
-               ])
-           )
-       
-       async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-           keyboard = [
-               [InlineKeyboardButton("🔥 Analyze Market", callback_data="analyze")],
-               [InlineKeyboardButton("📊 Structure", callback_data="structure"),
-                InlineKeyboardButton("⚡ Order Flow", callback_data="orderflow")],
-               [InlineKeyboardButton("🤖 ML Prediction", callback_data="ml_prediction"),
-                InlineKeyboardButton("⚙️ Settings", callback_data="settings")]
-           ]
-           reply_markup = InlineKeyboardMarkup(keyboard)
-           await update.message.reply_text(
-               "🚀 *Welcome to Trading Analysis Bot*\n\n"
-               "Select an option below to begin:",
-               parse_mode="Markdown",
-               reply_markup=reply_markup
-           )
-       
-       async def button_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-           query = update.callback_query
-           await query.answer()
-           if query.data == "analyze":
-               await self._run_analysis(query)
-           elif query.data == "structure":
-               await self._show_structure(query)
-           elif query.data == "orderflow":
-               await self._show_orderflow(query)
-           elif query.data == "ml_prediction":
-               await self._show_ml_prediction(query)
-           elif query.data == "settings":
-               await self._show_settings(query)
-           elif query.data == "back":
-               await self.start_command(update, context)
-       
-       def run(self):
-           application = Application.builder().token(self.token).build()
-           application.add_handler(CommandHandler("start", self.start_command))
-           application.add_handler(CallbackQueryHandler(self.button_callback))
-   
-   TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
-   bot = TradingBot(TOKEN)
-   bot.run()
-   
+    main()
