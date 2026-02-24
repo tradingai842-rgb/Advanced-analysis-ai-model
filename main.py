@@ -52,6 +52,25 @@ TWELVE_DATA_API_KEY = "ce0dbe1303af4be6b0cbe593744c01bd"
 POLYGON_API_KEY = "0n_l16xhW0_6Rpt9ZVQNYXD77ywLW68l"
 NEWS_API_KEY = "23a88a95fc774d76afd8ffcee66ccb01"
 TELEGRAM_TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
+DB_NAME = "xauusd_ai.db"
+MODEL_FILE = "xauusd_model.pkl"
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("CREATE TABLE IF NOT EXISTS trades(id INTEGER PRIMARY KEY AUTOINCREMENT, direction TEXT, entry REAL, result INTEGER)")
+    conn.commit()
+    conn.close()
+
+def fetch_data(interval="15min", outputsize=500):
+    url = "https://api.twelvedata.com/time_series"
+    params = {"symbol":"XAU/USD","interval":interval,"outputsize":outputsize,"apikey":TWELVE_KEY}
+    r = requests.get(url, params=params).json()
+    if "values" not in r:
+        raise Exception("Twelve Data API Error: "+str(r))
+    df = pd.DataFrame(r["values"])
+    df = df.astype(float).iloc[::-1].reset_index(drop=True)
+    return df
 
 MIN_CONFIDENCE = 80.0
 RISK_PER_TRADE = 0.02
