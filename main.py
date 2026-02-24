@@ -2,13 +2,10 @@ import asyncio
 import logging
 import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple, Deque, Any
-from dataclasses import dataclass, field
-from enum import Enum
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple, Any
 import aiohttp
 import json
-from collections import deque
 import time
 import warnings
 warnings.filterwarnings('ignore')
@@ -27,7 +24,7 @@ except ImportError:
 
 try:
     from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
+    from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
 except ImportError:
     logger.error("python-telegram-bot not installed. Install with: pip install python-telegram-bot")
     raise
@@ -51,7 +48,6 @@ except ImportError:
 TWELVE_DATA_API_KEY = "ce0dbe1303af4be6b0cbe593744c01bd"
 TELEGRAM_TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
 
-
 MIN_CONFIDENCE = 60.0
 TARGET_CONFIDENCE = 85.0
 RISK_PER_TRADE = 0.02
@@ -71,53 +67,29 @@ TIMEFRAMES = {
     "1h": "1h"
 }
 
-class MarketStructure(Enum):
-    UPTREND = "uptrend"
-    DOWNTREND = "downtrend"
-    RANGING = "ranging"
-    BREAKOUT = "breakout"
-    REVERSAL = "reversal"
-
-class TradeStatus(Enum):
-    VALID = "valid"
-    NO_SETUP = "no_setup"
-    LOW_CONFIDENCE = "low_confidence"
-
-class OrderBlock:
-    high: float
-    low: float
-    open_price: float
-    close_price: float
-    timestamp: datetime
-    ob_type: str
-    is_valid: bool = True
-    times_tested: int = 0
-    strength_score: float = 0.0
-    is_fresh: bool = True
-
 class SignalResult:
-    direction: Optional[str]
-    entry: float
-    stop_loss: float
-    take_profit_1: float
-    take_profit_2: float
-    confidence: float
-    confluence_count: int
-    factors: List[str]
-    timeframe_alignment: Dict[str, str]
-    status: TradeStatus
-    timestamp: datetime
-    invalid_reason: Optional[str] = None
+    def __init__(self, direction=None, entry=0.0, stop_loss=0.0, 
+                 take_profit_1=0.0, take_profit_2=0.0, confidence=0.0,
+                 confluence_count=0, factors=None, timeframe_alignment=None,
+                 status="NO_SETUP", timestamp=None, invalid_reason=None):
+        self.direction = direction
+        self.entry = entry
+        self.stop_loss = stop_loss
+        self.take_profit_1 = take_profit_1
+        self.take_profit_2 = take_profit_2
+        self.confidence = confidence
+        self.confluence_count = confluence_count
+        self.factors = factors or []
+        self.timeframe_alignment = timeframe_alignment or {}
+        self.status = status
+        self.timestamp = timestamp or datetime.now()
+        self.invalid_reason = invalid_reason
 
 class TwelveDataClient:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://api.twelvedata.com"
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.fallback_urls = [
-            "https://api.twelvedata.com",
-            "https://twelve-data1.p.rapidapi.com"
-        ]
+        self.session = None
     
     async def __aenter__(self):
         timeout = aiohttp.ClientTimeout(total=60, connect=10)
@@ -128,7 +100,7 @@ class TwelveDataClient:
         if self.session:
             await self.session.close()
     
-    async def _fetch_with_retry(self, url: str, params: Dict, max_retries: int = 3) -> Optional[Dict]:
+    async def _fetch_with_retry(self, url, params, max_retries=3):
         for attempt in range(max_retries):
             try:
                 async with self.session.get(url, params=params, ssl=False) as response:
@@ -145,10 +117,9 @@ class TwelveDataClient:
                 logger.error(f"Attempt {attempt + 1} failed: {e}")
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1 * (attempt + 1))
-        
         return None
     
-    async def get_ohlcv(self, symbol: str, interval: str, outputsize: int = 500) -> Optional[pd.DataFrame]:
+    async def get_ohlcv(self, symbol, interval, outputsize=500):
         url = f"{self.base_url}/time_series"
         params = {
             "symbol": symbol,
@@ -161,12 +132,8 @@ class TwelveDataClient:
         
         data = await self._fetch_with_retry(url, params)
         
-        if not data:
-            logger.error(f"No data returned for {symbol} {interval}")
-            return None
-        
-        if "values" not in data:
-            logger.error(f"Invalid response: {data.get('message', str(data)[:200])}")
+        if not data or "values" not in data:
+            logger.error(f"No data for {symbol} {interval}")
             return None
         
         try:
@@ -174,15 +141,14 @@ class TwelveDataClient:
             df["datetime"] = pd.to_datetime(df["datetime"])
             df.set_index("datetime", inplace=True)
             
-            numeric_cols = ["open", "high", "low", "close"]
-            for col in numeric_cols:
+            for col in ["open", "high", "low", "close"]:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
             
             if "volume" in df.columns:
                 df["volume"] = pd.to_numeric(df["volume"], errors='coerce').fillna(0)
             
-            df = df.dropna(subset=numeric_cols)
+            df = df.dropna(subset=["open", "high", "low", "close"])
             
             if len(df) < 50:
                 logger.warning(f"Insufficient data: {len(df)} rows")
@@ -195,13 +161,13 @@ class TwelveDataClient:
             logger.error(f"Data parsing error: {e}")
             return None
     
-    async def get_quote(self, symbol: str) -> Optional[Dict]:
+    async def get_quote(self, symbol):
         url = f"{self.base_url}/quote"
         params = {"symbol": symbol, "apikey": self.api_key}
         return await self._fetch_with_retry(url, params)
 
 class LSTMModel:
-    def __init__(self, sequence_length: int = 60):
+    def __init__(self, sequence_length=60):
         self.sequence_length = sequence_length
         self.model = None
         self.scaler = StandardScaler()
@@ -211,7 +177,6 @@ class LSTMModel:
     def _build_model(self):
         if not tf:
             return
-        
         try:
             self.model = Sequential([
                 Bidirectional(LSTM(128, return_sequences=True), 
@@ -229,7 +194,7 @@ class LSTMModel:
             logger.error(f"Model build error: {e}")
             self.model = None
     
-    def predict(self, df: pd.DataFrame) -> Tuple[float, float]:
+    def predict(self, df):
         if not tf or not self.model or len(df) < self.sequence_length:
             return 0.0, 0.0
         
@@ -258,11 +223,11 @@ class LSTMModel:
 
 class SMCAnalyzer:
     def __init__(self):
-        self.order_blocks: deque = deque(maxlen=50)
-        self.liquidity_zones: List[Dict] = []
-        self.fvgs: List[Dict] = []
+        self.order_blocks = []
+        self.liquidity_zones = []
+        self.fvgs = []
     
-    def detect_swing_points(self, df: pd.DataFrame, lookback: int = 5) -> Tuple[List[int], List[int]]:
+    def detect_swing_points(self, df, lookback=5):
         if len(df) < lookback * 2 + 1:
             return [], []
         
@@ -274,10 +239,11 @@ class SMCAnalyzer:
         
         for i in range(lookback, len(df) - lookback):
             try:
-                is_swing_high = all(highs[i] >= highs[i-j] for j in range(1, lookback+1)) and \
-                               all(highs[i] >= highs[i+j] for j in range(1, lookback+1))
-                is_swing_low = all(lows[i] <= lows[i-j] for j in range(1, lookback+1)) and \
-                              all(lows[i] <= lows[i+j] for j in range(1, lookback+1))
+                is_swing_high = all(highs[i] >= highs[i-j] for j in range(1, lookback+1))
+                is_swing_high = is_swing_high and all(highs[i] >= highs[i+j] for j in range(1, lookback+1))
+                
+                is_swing_low = all(lows[i] <= lows[i-j] for j in range(1, lookback+1))
+                is_swing_low = is_swing_low and all(lows[i] <= lows[i+j] for j in range(1, lookback+1))
                 
                 if is_swing_high:
                     swing_highs.append(i)
@@ -288,8 +254,8 @@ class SMCAnalyzer:
         
         return swing_highs, swing_lows
     
-    def identify_order_blocks(self, df: pd.DataFrame):
-        self.order_blocks.clear()
+    def identify_order_blocks(self, df):
+        self.order_blocks = []
         
         if len(df) < 3:
             return
@@ -308,50 +274,54 @@ class SMCAnalyzer:
                 
                 momentum = abs(prev["close"] - prev2["open"])
                 
+                ob = None
                 if current["close"] > current["open"] and momentum > body_size * 0.3:
                     strength = min((body_size / range_size) * 0.5 + 0.3, 1.0) if range_size > 0 else 0.3
-                    self.order_blocks.append(OrderBlock(
-                        high=float(current["high"]),
-                        low=float(current["low"]),
-                        open_price=float(current["open"]),
-                        close_price=float(current["close"]),
-                        timestamp=df.index[i],
-                        ob_type="bullish",
-                        strength_score=strength
-                    ))
-                
+                    ob = {
+                        "high": float(current["high"]),
+                        "low": float(current["low"]),
+                        "type": "bullish",
+                        "strength": strength,
+                        "valid": True,
+                        "fresh": True,
+                        "tested": 0
+                    }
                 elif current["close"] < current["open"] and momentum > body_size * 0.3:
                     strength = min((body_size / range_size) * 0.5 + 0.3, 1.0) if range_size > 0 else 0.3
-                    self.order_blocks.append(OrderBlock(
-                        high=float(current["high"]),
-                        low=float(current["low"]),
-                        open_price=float(current["open"]),
-                        close_price=float(current["close"]),
-                        timestamp=df.index[i],
-                        ob_type="bearish",
-                        strength_score=strength
-                    ))
+                    ob = {
+                        "high": float(current["high"]),
+                        "low": float(current["low"]),
+                        "type": "bearish",
+                        "strength": strength,
+                        "valid": True,
+                        "fresh": True,
+                        "tested": 0
+                    }
+                
+                if ob:
+                    self.order_blocks.append(ob)
+                    
             except Exception as e:
                 continue
     
-    def update_ob_validity(self, current_price: float):
+    def update_ob_validity(self, current_price):
         for ob in self.order_blocks:
-            if ob.ob_type == "bullish":
-                if current_price < ob.low:
-                    ob.is_valid = False
-                elif current_price > ob.high:
-                    ob.times_tested += 1
+            if ob["type"] == "bullish":
+                if current_price < ob["low"]:
+                    ob["valid"] = False
+                elif current_price > ob["high"]:
+                    ob["tested"] += 1
             else:
-                if current_price > ob.high:
-                    ob.is_valid = False
-                elif current_price < ob.low:
-                    ob.times_tested += 1
+                if current_price > ob["high"]:
+                    ob["valid"] = False
+                elif current_price < ob["low"]:
+                    ob["tested"] += 1
             
-            if ob.times_tested >= 3:
-                ob.is_fresh = False
+            if ob["tested"] >= 3:
+                ob["fresh"] = False
     
-    def detect_fvg(self, df: pd.DataFrame):
-        self.fvgs.clear()
+    def detect_fvg(self, df):
+        self.fvgs = []
         
         if len(df) < 3:
             return
@@ -365,21 +335,21 @@ class SMCAnalyzer:
                     self.fvgs.append({
                         "high": float(c2["low"]),
                         "low": float(c1["high"]),
-                        "is_bullish": True,
-                        "is_filled": False
+                        "bullish": True,
+                        "filled": False
                     })
                 elif c2["high"] < c1["low"]:
                     self.fvgs.append({
                         "high": float(c1["low"]),
                         "low": float(c2["high"]),
-                        "is_bullish": False,
-                        "is_filled": False
+                        "bullish": False,
+                        "filled": False
                     })
             except:
                 continue
     
-    def detect_liquidity(self, df: pd.DataFrame, swing_highs: List[int], swing_lows: List[int]):
-        self.liquidity_zones.clear()
+    def detect_liquidity(self, df, swing_highs, swing_lows):
+        self.liquidity_zones = []
         
         if not swing_highs or not swing_lows or len(df) < 10:
             return
@@ -393,8 +363,7 @@ class SMCAnalyzer:
                 if cluster >= 2:
                     self.liquidity_zones.append({
                         "price": float(high),
-                        "type": "equal_highs",
-                        "is_swept": False
+                        "type": "equal_highs"
                     })
             
             for low in recent_lows[-5:]:
@@ -402,14 +371,13 @@ class SMCAnalyzer:
                 if cluster >= 2:
                     self.liquidity_zones.append({
                         "price": float(low),
-                        "type": "equal_lows",
-                        "is_swept": False
+                        "type": "equal_lows"
                     })
         except:
             pass
 
 class TechnicalAnalyzer:
-    def calculate_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
+    def calculate_indicators(self, df):
         try:
             close = df["close"].values
             high = df["high"].values
@@ -460,7 +428,7 @@ class TechnicalAnalyzer:
             logger.error(f"Indicator error: {e}")
             return df
     
-    def check_trend_alignment(self, data: Dict[str, pd.DataFrame]) -> Dict[str, str]:
+    def check_trend_alignment(self, data):
         alignment = {}
         
         for tf, df in data.items():
@@ -490,7 +458,7 @@ class ScalpingEngine:
         self.tech = TechnicalAnalyzer()
         self.lstm = LSTMModel()
     
-    def analyze(self, data: Dict[str, pd.DataFrame], current_price: float) -> SignalResult:
+    def analyze(self, data, current_price):
         df_1m = data.get("1m", pd.DataFrame())
         df_5m = data.get("5m", pd.DataFrame())
         df_15m = data.get("15m", pd.DataFrame())
@@ -501,8 +469,7 @@ class ScalpingEngine:
             return SignalResult(
                 direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
                 confidence=0, confluence_count=0, factors=[], timeframe_alignment={},
-                status=TradeStatus.NO_SETUP, timestamp=datetime.now(),
-                invalid_reason="Insufficient 1m data"
+                status="NO_SETUP", invalid_reason="Insufficient 1m data"
             )
         
         swing_highs, swing_lows = self.smc.detect_swing_points(df_5m)
@@ -540,8 +507,7 @@ class ScalpingEngine:
             return SignalResult(
                 direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
                 confidence=0, confluence_count=0, factors=[], timeframe_alignment=alignment,
-                status=TradeStatus.NO_SETUP, timestamp=datetime.now(),
-                invalid_reason=f"Low ADX (1h:{adx_1h:.1f}, 15m:{adx_15m:.1f})"
+                status="NO_SETUP", invalid_reason=f"Low ADX (1h:{adx_1h:.1f}, 15m:{adx_15m:.1f})"
             )
         
         atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else current_price * 0.0005
@@ -568,14 +534,14 @@ class ScalpingEngine:
                 factors.append("MACD bullish cross")
             
             for ob in self.smc.order_blocks:
-                if ob.ob_type == "bullish" and ob.is_valid and ob.is_fresh:
-                    if abs(current_price - ob.low) < atr * 2:
-                        score += 15 + int(ob.strength_score * 10)
-                        factors.append(f"Bullish OB @ {ob.low:.2f} (strength:{ob.strength_score:.2f})")
+                if ob["type"] == "bullish" and ob["valid"] and ob["fresh"]:
+                    if abs(current_price - ob["low"]) < atr * 2:
+                        score += 15 + int(ob["strength"] * 10)
+                        factors.append(f"Bullish OB @ {ob['low']:.2f}")
                         break
             
             for fvg in self.smc.fvgs:
-                if fvg["is_bullish"] and not fvg["is_filled"]:
+                if fvg["bullish"] and not fvg["filled"]:
                     if fvg["low"] <= current_price <= fvg["high"]:
                         score += 10
                         factors.append("Inside bullish FVG")
@@ -606,14 +572,14 @@ class ScalpingEngine:
                 factors.append("MACD bearish cross")
             
             for ob in self.smc.order_blocks:
-                if ob.ob_type == "bearish" and ob.is_valid and ob.is_fresh:
-                    if abs(current_price - ob.high) < atr * 2:
-                        score += 15 + int(ob.strength_score * 10)
-                        factors.append(f"Bearerish OB @ {ob.high:.2f} (strength:{ob.strength_score:.2f})")
+                if ob["type"] == "bearish" and ob["valid"] and ob["fresh"]:
+                    if abs(current_price - ob["high"]) < atr * 2:
+                        score += 15 + int(ob["strength"] * 10)
+                        factors.append(f"Bearerish OB @ {ob['high']:.2f}")
                         break
             
             for fvg in self.smc.fvgs:
-                if not fvg["is_bullish"] and not fvg["is_filled"]:
+                if not fvg["bullish"] and not fvg["filled"]:
                     if fvg["low"] <= current_price <= fvg["high"]:
                         score += 10
                         factors.append("Inside bearish FVG")
@@ -636,8 +602,8 @@ class ScalpingEngine:
             return SignalResult(
                 direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
                 confidence=min(score, 100), confluence_count=confluence, factors=factors,
-                timeframe_alignment=alignment, status=TradeStatus.NO_SETUP,
-                timestamp=datetime.now(), invalid_reason=f"No setup (score:{score:.1f})"
+                timeframe_alignment=alignment, status="NO_SETUP",
+                invalid_reason=f"No setup (score:{score:.1f})"
             )
         
         entry = current_price
@@ -662,8 +628,7 @@ class ScalpingEngine:
             confluence_count=confluence,
             factors=factors,
             timeframe_alignment=alignment,
-            status=TradeStatus.VALID,
-            timestamp=datetime.now()
+            status="VALID"
         )
 
 class XAUUSDBot:
@@ -674,7 +639,7 @@ class XAUUSDBot:
         self.monitoring = False
         self.chat_id = None
     
-    async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def start(self, update, context):
         self.chat_id = update.effective_chat.id
         
         keyboard = [
@@ -693,7 +658,7 @@ class XAUUSDBot:
             parse_mode="Markdown"
         )
     
-    async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def button_handler(self, update, context):
         query = update.callback_query
         await query.answer()
         
@@ -704,7 +669,7 @@ class XAUUSDBot:
         elif query.data == "stop":
             await self.stop_stream(query, context)
     
-    async def fetch_all_timeframes(self) -> Tuple[Dict[str, pd.DataFrame], Optional[float]]:
+    async def fetch_all_timeframes(self):
         data = {}
         current_price = None
         
@@ -800,7 +765,7 @@ class XAUUSDBot:
                 
                 now = time.time()
                 
-                if signal.status == TradeStatus.VALID and signal.confidence >= 80:
+                if signal.status == "VALID" and signal.confidence >= 80:
                     if self.chat_id:
                         await context.bot.send_message(
                             chat_id=self.chat_id,
@@ -824,8 +789,8 @@ class XAUUSDBot:
                 logger.error(f"Stream error: {e}")
                 await asyncio.sleep(60)
     
-    def format_signal_text(self, signal: SignalResult, is_alarm: bool) -> str:
-        if signal.status != TradeStatus.VALID:
+    def format_signal_text(self, signal, is_alarm=False):
+        if signal.status != "VALID":
             emoji = "⚪"
             header = f"{emoji} *XAUUSD ANALYSIS* {emoji}"
             
@@ -872,7 +837,7 @@ class XAUUSDBot:
         
         return text
     
-    async def send_signal_message(self, query, signal: SignalResult, is_stream: bool):
+    async def send_signal_message(self, query, signal, is_stream=False):
         text = self.format_signal_text(signal, is_alarm=signal.confidence >= 80)
         
         keyboard = [
@@ -895,8 +860,10 @@ def main():
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(CallbackQueryHandler(bot.button_handler))
     
-    logger.info("XAUUSD Scalper Bot starting...")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("XAUUSD Scalper Bot starting..."
+    application
+    .run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
+(
