@@ -1585,12 +1585,13 @@ class XAUUSDBot:
         message += f"{i}. {reason}\n"
 
     context = signal.context
-    structure = context.get('structure', 'N/A')
-    trend = context.get('trend_strength', 'N/A')
-    session = context.get('session', 'N/A')
-    vol = context.get('volatility', 'N/A')
-    delta = context.get('delta_bias', 'N/A')
-    smc_pressure = context.get('smart_money_pressure', 0.0)
+
+    structure = context.get("structure", "N/A")
+    trend = context.get("trend_strength", "N/A")
+    session = context.get("session", "N/A")
+    vol = context.get("volatility", "N/A")
+    delta = context.get("delta_bias", "N/A")
+    smc_pressure = context.get("smart_money_pressure", 0.0)
 
     message += f"""
 *Context:*
@@ -1610,7 +1611,8 @@ SMC Pressure: {smc_pressure:+.2f}
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(text=message, reply_markup=reply_markup, parse_mode="Markdown")
-
-
-   
+    await update.message.reply_text(
+        text=message,
+        reply_markup=reply_markup,
+        parse_mode="Markdown"
+    )
