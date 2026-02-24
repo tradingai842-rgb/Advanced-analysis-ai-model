@@ -1501,31 +1501,33 @@ class XAUUSDBot:
         )
     
     async def button_handler(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+        query = update.callback_query
+        await query.answer()
 
-    if query.data == "analyze":
-        await self._run_full_analysis(query)
-    elif query.data == "structure":
-        await self._show_structure(query)
-    elif query.data == "orderflow":
-        await self._show_orderflow(query)
-    elif query.data == "ml":
-        await self._show_ml_prediction(query)
-    elif query.data == "settings":
-        await self._show_settings(query)
-    elif query.data == "back":
-        await self.start(update, context)
+        if query.data == "analyze":
+            await self._run_full_analysis(query)
+        elif query.data == "structure":
+            await self._show_structure(query)
+        elif query.data == "orderflow":
+            await self._show_orderflow(query)
+        elif query.data == "ml":
+            await self._show_ml_prediction(query)
+        elif query.data == "settings":
+            await self._show_settings(query)
+        elif query.data == "back":
+            await self.start(update, context)
 
-async def _run_full_analysis(self, query):
-    await query.edit_message_text("🔬 Running maximum analysis across all modules...")
+    async def _run_full_analysis(self, query):
+        await query.edit_message_text(
+            "🔬 Running maximum analysis across all modules..."
+        )
 
-    try:
-        async with self.data_client as client:
-            df_1m = await client.get_ohlcv("XAU/USD", "1min", outputsize=500)
-            df_5m = await client.get_ohlcv("XAU/USD", "5min", outputsize=500)
-            df_15m = await client.get_ohlcv("XAU/USD", "15min", outputsize=300)
-            df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=200)
+        try:
+            async with self.data_client as client:
+                df_1m = await client.get_ohlcv("XAU/USD", "1min", outputsize=500)
+                df_5m = await client.get_ohlcv("XAU/USD", "5min", outputsize=500)
+                df_15m = await client.get_ohlcv("XAU/USD", "15min", outputsize=300)
+                df_1h = await client.get_ohlcv("XAU/USD", "1h", outputsize=200)
 
         news_task = self.news_filter.get_trading_conditions()
         alt_task = self._get_alternative_data()
