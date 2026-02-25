@@ -61,9 +61,11 @@ except ImportError:
     logger.warning("TensorFlow not installed. ML features will be limited.")
     tf = None
 
+# API Keys
 TWELVE_DATA_API_KEY = "ce0dbe1303af4be6b0cbe593744c01bd"
 TELEGRAM_TOKEN = "8463088511:AAFU-8PL31RBVBrRPC3Dr5YiE0CMUGP02Ac"
 
+# Constants
 DB_NAME = "xauusd_ai.db"
 MODEL_DIR = "models"
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -75,28 +77,46 @@ TIMEFRAMES = {
     "30m": "30min",
 }
 
+# Session definitions (UTC hours)
+SESSIONS = {
+    'asia': (0, 8),           # 12AM–8AM
+    'london': (9, 18),        # 9AM–6PM
+    'london_open': (9, 11),   # 9AM–11AM
+    'london_ny_overlap': (14, 17),  # 2PM–5PM
+    'ny': (17, 23)            # 5PM–11PM
+}
+
 @dataclass
 class AdaptiveConfig:
-    min_confidence: float = 60.0
-    min_adx: float = 25.0
-    risk_per_trade: float = 0.02
+    min_confidence: float = 68.0  # 68-70% range
+    min_adx: float = 22.0
+    risk_per_trade: float = 0.0075  # 0.75-1% (start at 0.75%)
+    max_risk: float = 0.01  # 1% max
     atr_multiplier: float = 1.2
     success_threshold: float = 0.65
-    retrain_interval: int = 1
+    retrain_interval: int = 24  # Once per day (hours)
+    adx_filter_low: float = 18.0  # No trade below
+    adx_filter_medium: float = 22.0  # Reduced confidence between 18-22
+    max_consecutive_losses: int = 3
+    weight_freeze_trades: int = 50  # Freeze weights for 50-100 trades
+    regime_persistence: int = 3  # 3-5 candles before regime change
+    news_buffer_minutes: int = 10  # Avoid 5-10 min before news
     
     def to_dict(self):
         return asdict(self)
-    
+
     @classmethod
     def from_dict(cls, data):
         return cls(**data)
 
+
 class MetaLearningEngine:
     def __init__(self):
+        # Fixed weights as specified: SMC 35%, ML 30%, Tech 15%, Pattern 20%
         self.strategy_weights = {
-            'smc': 0.25,
-            'technical': 0.25,
+            'smc': 0.35,
             'ml_ensemble': 0.30,
+            'technical': 0.15,
             'pattern_memory': 0.20
         }
         self.performance_history = defaultdict(list)
@@ -105,11 +125,26 @@ class MetaLearningEngine:
         self.config = AdaptiveConfig()
         self.learning_rate = 0.1
         self.exploration_rate = 0.15
-        
+        self.consecutive_losses = 0
+        self.total_trades_since_weight_update = 0
+        self.last_weight_update = datetime.now()
+        self.current_regime = 'unknown'
+        self.regime_candle_count = 0
+
     def update_strategy_weights(self, trade_results: List[Dict]):
+        """Update weights only after 50-100 trades (frozen period)"""
+        new_trades = len(trade_results)
+        self.total_trades_since_weight_update += new_trades
+        
+        # Check if we've hit the freeze threshold
+        if self.total_trades_since_weight_update < self.config.weight_freeze_trades:
+            logger.info(f"Weights frozen: {self.total_trades_since_weight_update}/{self.config.weight_freeze_trades} trades")
+            return
+            
         if len(trade_results) < 10:
             return
-        
+
+        # Calculate performance per strategy
         strategy_performance = {}
         for strategy in self.strategy_weights.keys():
             relevant_trades = [
@@ -121,112 +156,213 @@ class MetaLearningEngine:
                 strategy_performance[strategy] = wins / len(relevant_trades)
             else:
                 strategy_performance[strategy] = 0.5
-        
+
+        # Softmax update with temperature
         temperature = 0.5
         exp_scores = {
             k: np.exp(v / temperature) 
             for k, v in strategy_performance.items()
         }
         total = sum(exp_scores.values())
-        
+
         new_weights = {k: exp_scores[k] / total for k in exp_scores}
-        self.strategy_weights = {
-            k: 0.7 * self.strategy_weights[k] + 0.3 * new_weights[k]
-            for k in self.strategy_weights
+        
+        # Blend with fixed baseline weights (70% fixed, 30% adaptive)
+        baseline_weights = {
+            'smc': 0.35,
+            'ml_ensemble': 0.30,
+            'technical': 0.15,
+            'pattern_memory': 0.20
         }
         
+        self.strategy_weights = {
+            k: 0.7 * baseline_weights[k] + 0.3 * new_weights[k]
+            for k in self.strategy_weights
+        }
+
+        # Normalize
         total = sum(self.strategy_weights.values())
         self.strategy_weights = {k: v / total for k, v in self.strategy_weights.items()}
+
+        # Reset counter
+        self.total_trades_since_weight_update = 0
+        self.last_weight_update = datetime.now()
         
         logger.info(f"Updated strategy weights: {self.strategy_weights}")
-    
+
     def _strategy_contributed(self, trade: Dict, strategy: str) -> bool:
         factors = trade.get('factors', [])
         strategy_keywords = {
-            'smc': ['OB', 'FVG', 'liquidity', 'order block'],
-            'technical': ['RSI', 'MACD', 'EMA', 'ADX'],
-            'ml_ensemble': ['DL ensemble', 'LSTM', 'Random Forest'],
-            'pattern_memory': ['Historical pattern', 'success rate']
+            'smc': ['OB', 'FVG', 'liquidity', 'order block', 'SMC'],
+            'technical': ['RSI', 'MACD', 'EMA', 'ADX', 'technical'],
+            'ml_ensemble': ['DL ensemble', 'LSTM', 'Random Forest', 'ML'],
+            'pattern_memory': ['Historical pattern', 'success rate', 'Pattern']
         }
         return any(keyword in str(factors) for keyword in strategy_keywords.get(strategy, []))
-    
+
+    def detect_market_regime(self, df_1h, current_hour: int) -> str:
+        """Detect one of 4 regimes: Asia Range, London Expansion, NY Volatility, Post-News"""
+        if df_1h.empty or "adx" not in df_1h.columns:
+            return "unknown"
+            
+        adx = df_1h["adx"].iloc[-1]
+        atr_percent = df_1h["atr_percent"].iloc[-1] if "atr_percent" in df_1h.columns else 1.0
+        
+        # Determine base session
+        if 0 <= current_hour < 8:
+            base_regime = "asia_range"
+        elif 9 <= current_hour < 14:
+            base_regime = "london_expansion"
+        elif 14 <= current_hour < 17:
+            base_regime = "london_ny_overlap"
+        elif 17 <= current_hour < 21:
+            base_regime = "ny_volatility"
+        else:
+            base_regime = "post_news_liquidity"
+            
+        # Check persistence (3-5 candles)
+        if base_regime == self.current_regime:
+            self.regime_candle_count += 1
+        else:
+            if self.regime_candle_count < self.config.regime_persistence:
+                # Stay in current regime until persistence threshold
+                return self.current_regime
+            self.current_regime = base_regime
+            self.regime_candle_count = 1
+            
+        return self.current_regime
+
     def adapt_to_market_regime(self, current_regime: str, trade_history: List[Dict]):
+        """Adapt risk and confidence by regime after persistence confirmed"""
+        if self.regime_candle_count < self.config.regime_persistence:
+            return  # Wait for persistence
+            
         regime_trades = [
             t for t in trade_history 
             if t.get('market_regime') == current_regime
         ]
-        
+
         if len(regime_trades) < 20:
             return
-        
+
         wins = [t for t in regime_trades if t['actual_result'] == 'SUCCESS']
         win_rate = len(wins) / len(regime_trades)
         
-        if current_regime == 'trending':
+        # Update consecutive losses
+        recent_losses = sum(1 for t in regime_trades[-5:] if t['actual_result'] != 'SUCCESS')
+        if recent_losses >= self.config.max_consecutive_losses:
+            logger.warning(f"Max consecutive losses ({self.config.max_consecutive_losses}) reached - pausing")
+            self.config.min_confidence = min(75.0, self.config.min_confidence * 1.05)  # Increase threshold
+
+        # Regime-specific adaptations
+        if current_regime == 'asia_range':
+            # Lower confidence, tighter risk in ranging Asia
+            self.config.min_adx = max(20.0, 22.0)
+            self.config.risk_per_trade = 0.0075  # 0.75%
             if win_rate > 0.6:
-                self.config.min_adx = max(20.0, self.config.min_adx * 0.95)
-                self.config.min_confidence = max(55.0, self.config.min_confidence * 0.97)
-            else:
-                self.config.min_adx = min(30.0, self.config.min_adx * 1.05)
-                self.config.min_confidence = min(70.0, self.config.min_confidence * 1.03)
-        elif current_regime == 'ranging':
-            if win_rate > 0.6:
-                self.config.min_adx = min(35.0, self.config.min_adx * 1.05)
-            else:
-                self.config.min_adx = max(15.0, self.config.min_adx * 0.95)
-        
+                self.config.min_confidence = max(65.0, 68.0 * 0.98)
+        elif current_regime == 'london_expansion':
+            # Trend following mode
+            self.config.min_adx = 22.0
+            self.config.risk_per_trade = min(0.01, 0.0075 * 1.1) if win_rate > 0.6 else 0.0075
+        elif current_regime == 'ny_volatility':
+            # High volatility - reduce size, increase confidence threshold
+            self.config.min_adx = 25.0
+            self.config.risk_per_trade = 0.0075
+            self.config.min_confidence = min(72.0, 68.0 * 1.03)
+        elif current_regime == 'post_news_liquidity':
+            # Careful mode
+            self.config.min_adx = 20.0
+            self.config.risk_per_trade = 0.0075
+            self.config.min_confidence = 70.0
+
+        # Kelly criterion sizing (capped at 1%)
         if win_rate > 0.5:
-            avg_win = np.mean([t['profit_loss'] for t in wins if t['profit_loss']])
+            avg_win = np.mean([t['profit_loss'] for t in wins if t['profit_loss']]) or 1
             losses = [t for t in regime_trades if t['actual_result'] != 'SUCCESS']
             avg_loss = np.mean([abs(t['profit_loss']) for t in losses if t['profit_loss']]) or 1
-            
+
             kelly_f = (win_rate - ((1 - win_rate) / (avg_win / avg_loss)))
-            self.config.risk_per_trade = np.clip(kelly_f * 0.5, 0.01, 0.05)
-        
+            self.config.risk_per_trade = np.clip(kelly_f * 0.5, 0.0075, 0.01)  # 0.75-1% cap
+
         self.market_regime_stats[current_regime] = {
             'win_rate': win_rate,
             'optimal_adx': self.config.min_adx,
             'optimal_confidence': self.config.min_confidence,
-            'kelly_fraction': self.config.risk_per_trade
+            'kelly_fraction': self.config.risk_per_trade,
+            'candle_count': self.regime_candle_count
         }
-        
+
         logger.info(f"Adapted to {current_regime}: ADX={self.config.min_adx:.1f}, "
                    f"Confidence={self.config.min_confidence:.1f}, Risk={self.config.risk_per_trade:.2%}")
-    
+
+    def check_filters(self, adx: float, alignment_count: int, 
+                     total_timeframes: int, session: str, 
+                     recent_losses: int, news_impending: bool = False) -> Tuple[bool, str]:
+        """Check all trading filters"""
+        
+        # ADX Filter
+        if adx < self.config.adx_filter_low:
+            return False, f"ADX {adx:.1f} < {self.config.adx_filter_low} (No trade)"
+        elif adx < self.config.adx_filter_medium:
+            # Reduce confidence and size
+            pass  # Handled in signal generation
+        
+        # Timeframe alignment (need 3/4)
+        if alignment_count < 3:
+            return False, f"Only {alignment_count}/{total_timeframes} timeframes aligned (need 3)"
+            
+        # 15M mixed + 30M weak check
+        # (Handled in alignment logic)
+        
+        # Asia session without breakout
+        if session == 'asia' and adx < 20:
+            return False, "Asia session without breakout"
+            
+        # News filter
+        if news_impending:
+            return False, f"High-impact news in {self.config.news_buffer_minutes} min"
+            
+        # Consecutive losses
+        if recent_losses >= self.config.max_consecutive_losses:
+            return False, f"{recent_losses} consecutive losses - trading paused"
+            
+        return True, "Passed"
+
     def discover_new_features(self, df: pd.DataFrame, trade_history: List[Dict]) -> List[str]:
         if len(trade_history) < 50:
             return []
-        
+
         features = []
         labels = []
-        
+
         for trade in trade_history:
             if 'market_state' not in trade:
                 continue
-            
+
             ms = json.loads(trade['market_state']) if isinstance(trade['market_state'], str) else trade['market_state']
             feature_vec = [
-                ms.get('adx', 25) / 100,
+                ms.get('adx', 22) / 100,
                 ms.get('atr_percent', 1) / 10,
                 ms.get('rsi', 50) / 100,
                 ms.get('trend_strength', 0.5),
                 ms.get('volatility', 0.5),
                 trade.get('hour', 12) / 24,
                 trade.get('day_of_week', 0) / 6,
-                trade.get('confidence', 60) / 100
+                trade.get('confidence', 68) / 100
             ]
             features.append(feature_vec)
             labels.append(1 if trade['actual_result'] == 'SUCCESS' else 0)
-        
+
         if len(features) < 30:
             return []
-        
+
         X = np.array(features)
         y = np.array(labels)
-        
+
         mi_scores = mutual_info_classif(X, y, random_state=42)
         feature_names = ['adx', 'atr', 'rsi', 'trend', 'volatility', 'hour', 'dow', 'confidence']
-        
+
         new_features = []
         for i, score in enumerate(mi_scores):
             if score > 0.1:
@@ -235,14 +371,14 @@ class MetaLearningEngine:
                     'importance': score,
                     'correlation': np.corrcoef(X[:, i], y)[0, 1]
                 })
-        
+
         self.feature_importance_history.append({
             'timestamp': datetime.now().isoformat(),
             'features': new_features
         })
-        
+
         return [f['name'] for f in sorted(new_features, key=lambda x: x['importance'], reverse=True)]
-    
+
     def generate_trade_signature(self, signal) -> str:
         key_data = {
             'direction': signal.direction,
@@ -252,16 +388,16 @@ class MetaLearningEngine:
             'hour': signal.timestamp.hour if signal.timestamp else 12
         }
         return hashlib.md5(json.dumps(key_data, sort_keys=True).encode()).hexdigest()[:16]
-    
+
     def get_similar_trade_performance(self, signature: str, trade_history: List[Dict]) -> Optional[Dict]:
         similar = [
             t for t in trade_history 
             if self._calculate_similarity(t, signature) > 0.8
         ]
-        
+
         if len(similar) < 5:
             return None
-        
+
         wins = sum(1 for t in similar if t['actual_result'] == 'SUCCESS')
         return {
             'sample_size': len(similar),
@@ -273,11 +409,11 @@ class MetaLearningEngine:
                 scale=stats.sem([1 if t['actual_result'] == 'SUCCESS' else 0 for t in similar])
             )
         }
-    
+
     def _calculate_similarity(self, trade: Dict, signature: str) -> float:
         trade_sig = self.generate_trade_signature_from_dict(trade)
         return 1.0 if trade_sig == signature else 0.0
-    
+
     def generate_trade_signature_from_dict(self, trade: Dict) -> str:
         key_data = {
             'direction': trade.get('direction'),
@@ -287,26 +423,31 @@ class MetaLearningEngine:
             'hour': trade.get('hour')
         }
         return hashlib.md5(json.dumps(key_data, sort_keys=True).encode()).hexdigest()[:16]
-    
+
     def save_state(self):
         state = {
             'strategy_weights': self.strategy_weights,
             'config': self.config.to_dict(),
             'market_regime_stats': self.market_regime_stats,
-            'feature_history': self.feature_importance_history[-100:]
+            'feature_history': self.feature_importance_history[-100:],
+            'consecutive_losses': self.consecutive_losses,
+            'total_trades': self.total_trades_since_weight_update
         }
         with open(os.path.join(MODEL_DIR, 'meta_learning_state.pkl'), 'wb') as f:
             pickle.dump(state, f)
-    
+
     def load_state(self):
         path = os.path.join(MODEL_DIR, 'meta_learning_state.pkl')
         if os.path.exists(path):
             with open(path, 'rb') as f:
                 state = pickle.load(f)
-                self.strategy_weights = state.get('strategy_weights', self.strategy_weights)
+                # Keep fixed weights, don't load old adaptive weights
+                # self.strategy_weights = state.get('strategy_weights', self.strategy_weights)
                 self.config = AdaptiveConfig.from_dict(state.get('config', self.config.to_dict()))
                 self.market_regime_stats = state.get('market_regime_stats', {})
                 self.feature_importance_history = state.get('feature_history', [])
+                self.consecutive_losses = state.get('consecutive_losses', 0)
+                self.total_trades_since_weight_update = state.get('total_trades', 0)
 
 
 class SignalResult:
@@ -346,11 +487,11 @@ class TradeDatabase:
         self.success_patterns = {}
         self.failure_patterns = {}
         self.load_cached_trades()
-    
+
     def init_db(self):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
@@ -380,9 +521,10 @@ class TradeDatabase:
             ema_alignment TEXT,
             session TEXT,
             day_of_week INTEGER,
-            hour INTEGER
+            hour INTEGER,
+            consecutive_losses INTEGER DEFAULT 0
         )''')
-        
+
         c.execute('''CREATE TABLE IF NOT EXISTS meta_learning_log (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             timestamp TEXT,
@@ -391,48 +533,48 @@ class TradeDatabase:
             market_regime TEXT,
             adaptation_trigger TEXT
         )''')
-        
+
         c.execute('''CREATE INDEX IF NOT EXISTS idx_trades_signature ON trades(trade_signature)''')
         c.execute('''CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp)''')
         c.execute('''CREATE INDEX IF NOT EXISTS idx_trades_result ON trades(actual_result)''')
-        
+
         conn.commit()
         conn.close()
-    
+
     def load_cached_trades(self):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
         c.execute("SELECT * FROM trades WHERE actual_result IS NOT NULL ORDER BY timestamp DESC LIMIT 2000")
         rows = c.fetchall()
         conn.close()
-        
+
         for row in rows:
             trade_data = self.row_to_dict(row)
             self.trade_cache.append(trade_data)
             self.analyze_pattern(trade_data)
-        
+
         logger.info(f"Loaded {len(self.trade_cache)} historical trades")
-    
+
     def row_to_dict(self, row):
         columns = ['id', 'timestamp', 'direction', 'entry', 'stop_loss', 'take_profit_1',
                    'take_profit_2', 'confidence', 'confluence_count', 'factors',
                    'timeframe_alignment', 'market_state', 'model_predictions', 'strategy_scores',
                    'trade_signature', 'status', 'actual_result', 'profit_loss', 'exit_price', 
                    'exit_time', 'market_regime', 'adx_value', 'atr_percent', 'rsi_value', 
-                   'macd_value', 'ema_alignment', 'session', 'day_of_week', 'hour']
+                   'macd_value', 'ema_alignment', 'session', 'day_of_week', 'hour', 'consecutive_losses']
         return {col: val for col, val in zip(columns, row)}
-    
+
     def analyze_pattern(self, trade_data):
         if not trade_data['actual_result']:
             return
-        
+
         pattern_key = json.dumps({
             'session': trade_data['session'],
             'hour': trade_data['hour'],
             'market_regime': trade_data['market_regime'],
             'ema_alignment': trade_data['ema_alignment']
         }, sort_keys=True)
-        
+
         if trade_data['actual_result'] == 'SUCCESS':
             if pattern_key not in self.success_patterns:
                 self.success_patterns[pattern_key] = {'count': 0, 'avg_profit': 0, 'trades': []}
@@ -448,21 +590,21 @@ class TradeDatabase:
             if pattern_key not in self.failure_patterns:
                 self.failure_patterns[pattern_key] = {'count': 0, 'avg_loss': 0}
             self.failure_patterns[pattern_key]['count'] += 1
-    
-    def save_trade(self, signal_result, market_state):
+
+    def save_trade(self, signal_result, market_state, consecutive_losses=0):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        
+
         dt = signal_result.timestamp
         signature = signal_result.trade_signature or "unknown"
-        
+
         c.execute('''INSERT INTO trades (
             timestamp, direction, entry, stop_loss, take_profit_1, take_profit_2,
             confidence, confluence_count, factors, timeframe_alignment, market_state,
             model_predictions, strategy_scores, trade_signature, status, market_regime, 
             adx_value, atr_percent, rsi_value, macd_value, ema_alignment, session, 
-            day_of_week, hour
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
+            day_of_week, hour, consecutive_losses
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''', (
             dt.isoformat(),
             signal_result.direction,
             signal_result.entry,
@@ -486,35 +628,54 @@ class TradeDatabase:
             market_state.get('ema_alignment', 'neutral'),
             market_state.get('session', 'unknown'),
             dt.weekday(),
-            dt.hour
+            dt.hour,
+            consecutive_losses
         ))
-        
+
         trade_id = c.lastrowid
         conn.commit()
         conn.close()
-        
+
         signal_result.trade_id = trade_id
         return trade_id
-    
+
     def update_trade_result(self, trade_id, result, profit_loss, exit_price):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        
+
         c.execute('''UPDATE trades SET 
             actual_result = ?, profit_loss = ?, exit_price = ?, exit_time = ?
             WHERE id = ?''', (
             result, profit_loss, exit_price, datetime.now().isoformat(), trade_id
         ))
-        
+
         conn.commit()
         conn.close()
-        
+
         self.load_cached_trades()
-    
+
+    def get_consecutive_losses(self, limit=10):
+        """Get number of recent consecutive losses"""
+        conn = sqlite3.connect(self.db_path)
+        c = conn.cursor()
+        c.execute('''SELECT actual_result FROM trades 
+                     WHERE actual_result IS NOT NULL 
+                     ORDER BY timestamp DESC LIMIT ?''', (limit,))
+        rows = c.fetchall()
+        conn.close()
+        
+        consecutive = 0
+        for (result,) in rows:
+            if result != 'SUCCESS':
+                consecutive += 1
+            else:
+                break
+        return consecutive
+
     def log_meta_adaptation(self, meta_engine, trigger: str):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
-        
+
         c.execute('''INSERT INTO meta_learning_log 
                      (timestamp, strategy_weights, config, market_regime, adaptation_trigger)
                      VALUES (?, ?, ?, ?, ?)''', (
@@ -524,10 +685,10 @@ class TradeDatabase:
             json.dumps(list(meta_engine.market_regime_stats.keys())),
             trigger
         ))
-        
+
         conn.commit()
         conn.close()
-    
+
     def get_training_data(self, limit=5000):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
@@ -536,9 +697,9 @@ class TradeDatabase:
                      ORDER BY timestamp DESC LIMIT ?''', (limit,))
         rows = c.fetchall()
         conn.close()
-        
+
         return [self.row_to_dict(row) for row in rows]
-    
+
     def get_trades_by_signature(self, signature: str, limit=100):
         conn = sqlite3.connect(self.db_path)
         c = conn.cursor()
@@ -560,7 +721,7 @@ class DeepLearningModel:
         self.feature_dim = 25
         self.autoencoder = None
         self.load_models()
-    
+
     def load_models(self):
         if tf and os.path.exists(os.path.join(MODEL_DIR, "lstm_model.h5")):
             try:
@@ -571,7 +732,7 @@ class DeepLearningModel:
                 self.build_lstm_model()
         elif tf:
             self.build_lstm_model()
-        
+
         if os.path.exists(os.path.join(MODEL_DIR, "rf_model.pkl")):
             try:
                 with open(os.path.join(MODEL_DIR, "rf_model.pkl"), 'rb') as f:
@@ -582,14 +743,14 @@ class DeepLearningModel:
                 self.rf_model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
         else:
             self.rf_model = RandomForestClassifier(n_estimators=200, max_depth=10, random_state=42)
-        
+
         if os.path.exists(os.path.join(MODEL_DIR, "scaler.pkl")):
             try:
                 with open(os.path.join(MODEL_DIR, "scaler.pkl"), 'rb') as f:
                     self.scaler = pickle.load(f)
             except Exception as e:
                 logger.error(f"Error loading scaler: {e}")
-        
+
         if os.path.exists(os.path.join(MODEL_DIR, "meta_model.pkl")):
             try:
                 with open(os.path.join(MODEL_DIR, "meta_model.pkl"), 'rb') as f:
@@ -599,40 +760,40 @@ class DeepLearningModel:
                 self.meta_model = GradientBoostingClassifier(n_estimators=100, random_state=42)
         else:
             self.meta_model = GradientBoostingClassifier(n_estimators=100, random_state=42)
-    
+
     def build_lstm_model(self):
         if not tf:
             return
-        
+
         inputs = Input(shape=(self.sequence_length, self.feature_dim))
-        
+
         x = Bidirectional(LSTM(128, return_sequences=True))(inputs)
         x = BatchNormalization()(x)
         x = Dropout(0.3)(x)
-        
+
         attention = Attention()([x, x])
         x = Concatenate()([x, attention])
-        
+
         x = Bidirectional(LSTM(64, return_sequences=False))(x)
         x = BatchNormalization()(x)
         x = Dropout(0.3)(x)
-        
+
         x = Dense(32, activation='relu', kernel_regularizer=l2(0.001))(x)
         x = Dropout(0.2)(x)
         outputs = Dense(1, activation='sigmoid')(x)
-        
+
         self.lstm_model = Model(inputs=inputs, outputs=outputs)
         self.lstm_model.compile(
             optimizer=Adam(learning_rate=0.001),
             loss='binary_crossentropy',
             metrics=['accuracy', 'Precision', 'Recall']
         )
-        
+
         logger.info("Built new Attention-LSTM model")
-    
+
     def prepare_sequence_features(self, df):
         features = []
-        
+
         for col in ['close', 'high', 'low', 'open', 'volume',
                     'rsi', 'macd', 'macd_signal', 'macd_hist',
                     'ema_9', 'ema_21', 'ema_50', 'ema_200',
@@ -643,10 +804,10 @@ class DeepLearningModel:
                 features.append(df[col].fillna(0).values[-self.sequence_length:])
             else:
                 features.append(np.zeros(self.sequence_length))
-        
+
         features = np.column_stack(features)
         return self.scaler.fit_transform(features)
-    
+
     def predict(self, df, market_state=None):
         if len(df) < self.sequence_length:
             return {
@@ -657,11 +818,11 @@ class DeepLearningModel:
                 'confidence': 0.0,
                 'uncertainty': 1.0
             }
-        
+
         try:
             X_seq = self.prepare_sequence_features(df)
             X_seq = X_seq.reshape(1, self.sequence_length, self.feature_dim)
-            
+
             lstm_preds = []
             if self.lstm_model and tf:
                 for _ in range(10):
@@ -672,7 +833,7 @@ class DeepLearningModel:
             else:
                 lstm_pred = 0.5
                 lstm_uncertainty = 0.5
-            
+
             X_rf = self.extract_rf_features(df)
             rf_pred = 0.5
             rf_uncertainty = 0.5
@@ -680,17 +841,17 @@ class DeepLearningModel:
                 rf_proba = self.rf_model.predict_proba(X_rf)[0]
                 rf_pred = rf_proba[1] if len(rf_proba) > 1 else 0.5
                 rf_uncertainty = 1 - max(rf_proba)
-            
+
             meta_features = np.array([[lstm_pred, rf_pred, 
-                                       market_state.get('adx', 25) / 100,
+                                       market_state.get('adx', 22) / 100,
                                        market_state.get('trend_strength', 0.5),
                                        market_state.get('volatility', 0.5)]])
-            
+
             meta_pred = 0.5
             if self.meta_model:
                 meta_proba = self.meta_model.predict_proba(meta_features)[0]
                 meta_pred = meta_proba[1] if len(meta_proba) > 1 else 0.5
-            
+
             total_uncertainty = lstm_uncertainty + rf_uncertainty + 0.1
             weights = [
                 (1 - lstm_uncertainty) / total_uncertainty,
@@ -698,12 +859,12 @@ class DeepLearningModel:
                 0.1 / total_uncertainty
             ]
             weights = np.array(weights) / sum(weights)
-            
+
             ensemble = weights[0] * lstm_pred + weights[1] * rf_pred + weights[2] * meta_pred
-            
+
             agreement = 1 - np.std([lstm_pred, rf_pred, meta_pred])
             confidence = agreement * (1 - np.mean([lstm_uncertainty, rf_uncertainty]))
-            
+
             return {
                 'lstm_prob': lstm_pred,
                 'rf_prob': rf_pred,
@@ -713,7 +874,7 @@ class DeepLearningModel:
                 'uncertainty': np.mean([lstm_uncertainty, rf_uncertainty]),
                 'model_weights': weights.tolist()
             }
-            
+
         except Exception as e:
             logger.error(f"Prediction error: {e}")
             return {
@@ -724,15 +885,15 @@ class DeepLearningModel:
                 'confidence': 0.0,
                 'uncertainty': 1.0
             }
-    
+
     def extract_rf_features(self, df):
         features = []
         row = df.iloc[-1]
-        
+
         feature_list = [
             row.get('rsi', 50) / 100,
             row.get('macd', 0) / 100,
-            row.get('adx', 25) / 100,
+            row.get('adx', 22) / 100,
             row.get('atr_percent', 1) / 10,
             row.get('bb_position', 0.5),
             1 if row.get('ema_9', 0) > row.get('ema_21', 0) else 0,
@@ -745,57 +906,57 @@ class DeepLearningModel:
             row.get('close', 0) / row.get('ema_200', 1) - 1,
             int(row.get('hour', 12) >= 8 and row.get('hour', 12) <= 17)
         ]
-        
+
         return np.array([feature_list])
-    
+
     def retrain(self, trade_history, meta_engine=None):
         if len(trade_history) < 10:
             logger.info(f"Insufficient trades for retrain: {len(trade_history)}")
             return False
-        
+
         logger.info(f"Retraining models with {len(trade_history)} trades...")
-        
+
         if meta_engine:
             self.sequence_length = min(60, max(30, len(trade_history) // 10))
-        
+
         success = self._retrain_rf(trade_history)
         success = self._retrain_meta(trade_history) and success
-        
+
         if tf:
             success = self._retrain_lstm(trade_history) and success
-        
+
         return success
-    
+
     def _retrain_rf(self, trade_history):
         try:
             X = []
             y = []
-            
+
             for trade in trade_history:
                 features = [
-                    trade.get('confidence', 50) / 100,
+                    trade.get('confidence', 68) / 100,
                     trade.get('confluence_count', 0) / 10,
-                    trade.get('adx_value', 25) / 100,
+                    trade.get('adx_value', 22) / 100,
                     trade.get('atr_percent', 1) / 10,
                     trade.get('rsi_value', 50) / 100,
-                    1 if trade.get('session') in ['london', 'ny_am'] else 0,
+                    1 if trade.get('session') in ['london', 'london_open', 'london_ny_overlap'] else 0,
                     trade.get('hour', 12) / 24,
                     trade.get('day_of_week', 0) / 6
                 ]
                 X.append(features)
                 y.append(1 if trade['actual_result'] == 'SUCCESS' else 0)
-            
+
             X = np.array(X)
             y = np.array(y)
-            
+
             tscv = TimeSeriesSplit(n_splits=3)
             best_score = 0
             best_model = None
-            
+
             for train_idx, val_idx in tscv.split(X):
                 X_train, X_val = X[train_idx], X[val_idx]
                 y_train, y_val = y[train_idx], y[val_idx]
-                
+
                 model = RandomForestClassifier(
                     n_estimators=300,
                     max_depth=15,
@@ -804,94 +965,94 @@ class DeepLearningModel:
                     random_state=42,
                     class_weight='balanced'
                 )
-                
+
                 model.fit(X_train, y_train)
                 score = f1_score(y_val, model.predict(X_val))
-                
+
                 if score > best_score:
                     best_score = score
                     best_model = model
-            
+
             self.rf_model = best_model
-            
+
             with open(os.path.join(MODEL_DIR, "rf_model.pkl"), 'wb') as f:
                 pickle.dump(self.rf_model, f)
-            
+
             logger.info(f"RF model retrained. Best F1: {best_score:.3f}")
             return True
-            
+
         except Exception as e:
             logger.error(f"RF retrain error: {e}")
             return False
-    
+
     def _retrain_meta(self, trade_history):
         try:
             X = []
             y = []
-            
+
             for trade in trade_history:
                 features = [
-                    trade.get('confidence', 50) / 100,
+                    trade.get('confidence', 68) / 100,
                     trade.get('confluence_count', 0) / 10,
-                    trade.get('adx_value', 25) / 100,
+                    trade.get('adx_value', 22) / 100,
                     trade.get('atr_percent', 1) / 10,
                     trade.get('rsi_value', 50) / 100
                 ]
                 X.append(features)
                 y.append(1 if trade['actual_result'] == 'SUCCESS' else 0)
-            
+
             X = np.array(X)
             y = np.array(y)
-            
+
             self.meta_model = GradientBoostingClassifier(
                 n_estimators=200,
                 max_depth=5,
                 learning_rate=0.1,
                 random_state=42
             )
-            
+
             self.meta_model.fit(X, y)
-            
+
             with open(os.path.join(MODEL_DIR, "meta_model.pkl"), 'wb') as f:
                 pickle.dump(self.meta_model, f)
-            
+
             logger.info("Meta model retrained")
             return True
-            
+
         except Exception as e:
             logger.error(f"Meta retrain error: {e}")
             return False
-    
+
     def _retrain_lstm(self, trade_history):
         if not tf:
             return True
-        
+
         try:
             sequences = []
             labels = []
-            
+
             for trade in trade_history:
                 if 'market_state' not in trade or not trade['market_state']:
                     continue
-                
+
                 market_state = json.loads(trade['market_state']) if isinstance(trade['market_state'], str) else trade['market_state']
-                
+
                 seq = np.array(market_state.get('sequence', []))
                 if len(seq) >= self.sequence_length:
                     sequences.append(seq[-self.sequence_length:])
                     labels.append(1 if trade['actual_result'] == 'SUCCESS' else 0)
-            
+
             if len(sequences) < 10:
                 logger.info(f"Insufficient sequences for LSTM: {len(sequences)}")
                 return True
-            
+
             X = np.array(sequences)
             y = np.array(labels)
-            
+
             X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-            
+
             self.build_lstm_model()
-            
+
             early_stop = EarlyStopping(monitor='val_loss', patience=10, restore_best_weights=True)
             lr_reduce = ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=5)
             checkpoint = ModelCheckpoint(
@@ -899,7 +1060,7 @@ class DeepLearningModel:
                 monitor='val_accuracy',
                 save_best_only=True
             )
-            
+
             self.lstm_model.fit(
                 X_train, y_train,
                 validation_split=0.2,
@@ -908,14 +1069,14 @@ class DeepLearningModel:
                 callbacks=[early_stop, lr_reduce, checkpoint],
                 verbose=0
             )
-            
+
             loss, accuracy, precision, recall = self.lstm_model.evaluate(X_test, y_test, verbose=0)
-            
+
             save_model(self.lstm_model, os.path.join(MODEL_DIR, "lstm_model.h5"))
-            
+
             logger.info(f"LSTM retrained. Accuracy: {accuracy:.3f}, Precision: {precision:.3f}")
             return True
-            
+
         except Exception as e:
             logger.error(f"LSTM retrain error: {e}")
             return False
@@ -943,12 +1104,12 @@ class TwelveDataClient:
         time_since_last = time.time() - self.last_request_time
         if time_since_last < min_interval:
             await asyncio.sleep(min_interval - time_since_last)
-        
+
         for attempt in range(max_retries):
             try:
                 async with self.session.get(url, params=params, ssl=False) as response:
                     self.last_request_time = time.time()
-                    
+
                     if response.status == 200:
                         data = await response.json()
                         self.rate_limit_remaining = int(response.headers.get('X-RateLimit-Remaining', 100))
@@ -1228,7 +1389,7 @@ class TechnicalAnalyzer:
 
             df["price_momentum"] = df["close"].pct_change(3)
             df["volatility_regime"] = df["atr_percent"].rolling(20).mean()
-            
+
             df = df.ffill().bfill().fillna(0)
             return df
 
@@ -1237,9 +1398,12 @@ class TechnicalAnalyzer:
             return df
 
     def check_trend_alignment(self, data):
+        """Check alignment across 1M, 5M, 15M, 30M timeframes"""
         alignment = {}
-
-        for tf, df in data.items():
+        required_tfs = ["1m", "5m", "15m", "30m"]
+        
+        for tf in required_tfs:
+            df = data.get(tf, pd.DataFrame())
             if df.empty or "ema_9" not in df.columns or len(df) < 2:
                 alignment[tf] = "NEUTRAL"
                 continue
@@ -1259,14 +1423,18 @@ class TechnicalAnalyzer:
                 alignment[tf] = "NEUTRAL"
 
         return alignment
-    
+
+    def count_aligned_timeframes(self, alignment: Dict, direction: str) -> int:
+        """Count timeframes aligned with direction (need 3/4)"""
+        return sum(1 for v in alignment.values() if v == direction)
+
     def detect_market_regime(self, df_1h):
         if df_1h.empty or "adx" not in df_1h.columns:
             return "unknown"
-        
+
         adx = df_1h["adx"].iloc[-1]
         atr_percent = df_1h["atr_percent"].iloc[-1] if "atr_percent" in df_1h.columns else 1.0
-        
+
         if adx > 30:
             return "strong_trend"
         elif adx > 25:
@@ -1288,10 +1456,26 @@ class ScalpingEngine:
         self.last_retrain = datetime.now()
         self.trade_monitoring = {}
         self.analysis_count = 0
-    
+        self.news_filter_active = False  # Placeholder for news integration
+
+    def get_current_session(self, hour: int) -> str:
+        """Determine trading session based on hour"""
+        if 0 <= hour < 8:
+            return 'asia'
+        elif 9 <= hour < 11:
+            return 'london_open'
+        elif 11 <= hour < 14:
+            return 'london'
+        elif 14 <= hour < 17:
+            return 'london_ny_overlap'
+        elif 17 <= hour < 21:
+            return 'ny'
+        else:
+            return 'post_news'
+
     def analyze(self, data, current_price):
         self.analysis_count += 1
-        
+
         df_1m = data.get("1m", pd.DataFrame())
         df_5m = data.get("5m", pd.DataFrame())
         df_15m = data.get("15m", pd.DataFrame())
@@ -1305,70 +1489,112 @@ class ScalpingEngine:
                 status="NO_SETUP", invalid_reason="Insufficient 1m data"
             )
 
-        market_regime = self.tech.detect_market_regime(df_1h)
+        current_hour = datetime.now().hour
+        current_session = self.get_current_session(current_hour)
         
+        # Detect market regime with persistence
+        market_regime = self.meta_engine.detect_market_regime(df_1h, current_hour)
+        
+        # Update adaptations every 10 analyses
         if self.analysis_count % 10 == 0:
             trade_history = self.db.get_training_data(limit=500)
             self.meta_engine.adapt_to_market_regime(market_regime, trade_history)
             self.meta_engine.update_strategy_weights(trade_history)
 
         config = self.meta_engine.config
+        
+        # Get consecutive losses
+        consecutive_losses = self.db.get_consecutive_losses(limit=5)
+        self.meta_engine.consecutive_losses = consecutive_losses
 
+        # SMC Analysis
         swing_highs, swing_lows = self.smc.detect_swing_points(df_5m)
         self.smc.identify_order_blocks(df_5m)
         self.smc.update_ob_validity(current_price)
         self.smc.detect_fvg(df_5m)
         self.smc.detect_liquidity(df_5m, swing_highs, swing_lows)
 
+        # Timeframe alignment (1M, 5M, 15M, 30M)
         alignment = self.tech.check_trend_alignment(data)
+        
+        bullish_count = self.tech.count_aligned_timeframes(alignment, "BULLISH")
+        bearish_count = self.tech.count_aligned_timeframes(alignment, "BEARISH")
 
-        bullish_count = sum(1 for v in alignment.values() if v == "BULLISH")
-        bearish_count = sum(1 for v in alignment.values() if v == "BEARISH")
-
+        # Determine trend bias (need 3/4 aligned)
         if bullish_count >= 3 and bearish_count >= 3:
             trend_bias = "CONFLICTED"
-        elif bullish_count >= 4:
-            trend_bias = "BULLISH"
-        elif bearish_count >= 4:
-            trend_bias = "BEARISH"
         elif bullish_count >= 3:
-            trend_bias = "BULLISH_WEAK"
+            trend_bias = "BULLISH"
         elif bearish_count >= 3:
+            trend_bias = "BEARISH"
+        elif bullish_count >= 2:
+            trend_bias = "BULLISH_WEAK"
+        elif bearish_count >= 2:
             trend_bias = "BEARISH_WEAK"
         else:
             trend_bias = "NEUTRAL"
 
+        # Check 15M mixed + 30M weak condition
+        if alignment.get("15m") == "MIXED" and alignment.get("30m") not in ["BULLISH", "BEARISH"]:
+            trend_bias = "NEUTRAL"  # Block trade if 15M mixed and 30M weak
+
         market_state = {
             'regime': market_regime,
-            'adx': df_1h["adx"].iloc[-1] if not df_1h.empty and "adx" in df_1h.columns else 25,
+            'adx': df_1h["adx"].iloc[-1] if not df_1h.empty and "adx" in df_1h.columns else 22,
             'atr_percent': df_1m["atr_percent"].iloc[-1] if "atr_percent" in df_1m.columns else 1.0,
             'rsi': df_1m["rsi"].iloc[-1] if "rsi" in df_1m.columns else 50,
             'macd': df_1m["macd"].iloc[-1] if "macd" in df_1m.columns else 0,
-            'ema_alignment': 'bullish' if bullish_count >= 4 else 'bearish' if bearish_count >= 4 else 'neutral',
-            'session': 'london' if 8 <= datetime.now().hour < 12 else 'ny_am' if 12 <= datetime.now().hour < 17 else 'ny_pm' if 17 <= datetime.now().hour < 21 else 'asia',
-            'trend_strength': max(bullish_count, bearish_count) / 5.0,
+            'ema_alignment': 'bullish' if bullish_count >= 3 else 'bearish' if bearish_count >= 3 else 'neutral',
+            'session': current_session,
+            'trend_strength': max(bullish_count, bearish_count) / 4.0,  # 4 timeframes
             'volatility': df_1m["atr_percent"].iloc[-1] / 10 if "atr_percent" in df_1m.columns else 0.5,
             'sequence': df_1m[['close', 'rsi', 'macd', 'adx', 'atr_percent']].values.tolist() if len(df_1m) >= 60 else []
         }
 
+        # Model predictions
         model_preds = self.dl_model.predict(df_1m, market_state)
 
-        strategy_scores = {}
+        # Check all filters
+        adx_1h = df_1h["adx"].iloc[-1] if not df_1h.empty and "adx" in df_1h.columns else 22
+        adx_15m = df_15m["adx"].iloc[-1] if not df_15m.empty and "adx" in df_15m.columns else 22
         
-        score = 0.0
-        factors = []
-        direction = None
-
-        adx_1h = df_1h["adx"].iloc[-1] if not df_1h.empty and "adx" in df_1h.columns else 25
-        adx_15m = df_15m["adx"].iloc[-1] if not df_15m.empty and "adx" in df_15m.columns else 25
-
-        if adx_1h < config.min_adx or adx_15m < config.min_adx:
+        # Use entry timeframe ADX (1M or 5M)
+        adx_entry = df_1m["adx"].iloc[-1] if "adx" in df_1m.columns else 22
+        
+        # Check filters
+        passed, filter_reason = self.meta_engine.check_filters(
+            adx=adx_entry,
+            alignment_count=max(bullish_count, bearish_count),
+            total_timeframes=4,
+            session=current_session,
+            recent_losses=consecutive_losses,
+            news_impending=self.news_filter_active
+        )
+        
+        if not passed:
             return SignalResult(
                 direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
                 confidence=0, confluence_count=0, factors=[], timeframe_alignment=alignment,
-                status="NO_SETUP", invalid_reason=f"Low ADX (1h:{adx_1h:.1f}, 15m:{adx_15m:.1f})",
+                status="NO_SETUP", invalid_reason=filter_reason,
                 market_state=market_state, model_predictions=model_preds
             )
+
+        # ADX scaling (18-22 range reduces confidence)
+        adx_penalty = 1.0
+        if adx_entry < config.adx_filter_medium:
+            adx_penalty = 0.8  # Reduce confidence and size
+            if adx_entry < config.adx_filter_low:
+                return SignalResult(
+                    direction=None, entry=0, stop_loss=0, take_profit_1=0, take_profit_2=0,
+                    confidence=0, confluence_count=0, factors=[], timeframe_alignment=alignment,
+                    status="NO_SETUP", invalid_reason=f"ADX {adx_entry:.1f} < {config.adx_filter_low}",
+                    market_state=market_state, model_predictions=model_preds
+                )
+
+        strategy_scores = {}
+        score = 0.0
+        factors = []
+        direction = None
 
         atr = df_1m["atr"].iloc[-1] if "atr" in df_1m.columns else current_price * 0.0005
 
@@ -1378,15 +1604,16 @@ class ScalpingEngine:
         macd_1m = df_1m["macd"].iloc[-1] if "macd" in df_1m.columns else 0
         macd_signal_1m = df_1m["macd_signal"].iloc[-1] if "macd_signal" in df_1m.columns else 0
 
+        # Pattern memory check
         pattern_check = self.db.get_training_data(limit=100)
         similar_performance = None
-        
+
         if "BULLISH" in trend_bias:
             smc_score = 0
             tech_score = 0
             ml_score = 0
             pattern_score = 0
-            
+
             if 20 < rsi_5m < 50:
                 smc_score += 15
                 factors.append("RSI pullback in uptrend")
@@ -1399,6 +1626,7 @@ class ScalpingEngine:
                 tech_score += 10
                 factors.append("MACD bullish cross")
 
+            # Order Blocks
             for ob in self.smc.order_blocks:
                 if ob["type"] == "bullish" and ob["valid"] and ob["fresh"]:
                     if abs(current_price - ob["low"]) < atr * 2:
@@ -1406,6 +1634,7 @@ class ScalpingEngine:
                         factors.append(f"Bullish OB @ {ob['low']:.2f}")
                         break
 
+            # FVG
             for fvg in self.smc.fvgs:
                 if fvg["bullish"] and not fvg["filled"]:
                     if fvg["low"] <= current_price <= fvg["high"]:
@@ -1413,47 +1642,53 @@ class ScalpingEngine:
                         factors.append("Inside bullish FVG")
                         break
 
+            # ML Ensemble (35% weight)
             if model_preds['ensemble'] > 0.6:
-                ml_score += 15
+                ml_score += 30  # Higher weight for ML
                 factors.append(f"DL ensemble bullish ({model_preds['ensemble']:.2f})")
             elif model_preds['ensemble'] > 0.5:
-                ml_score += 8
+                ml_score += 15
                 factors.append(f"DL weak bullish ({model_preds['ensemble']:.2f})")
 
-            if bullish_count >= 4:
+            # Technical (15% weight)
+            if bullish_count >= 3:
                 tech_score += 15
-                factors.append("Strong HTF alignment")
+                factors.append("Strong HTF alignment (3/4)")
 
-            pattern_check = self.meta_engine.get_similar_trade_performance(
+            # Pattern Memory (20% weight)
+            similar = self.meta_engine.get_similar_trade_performance(
                 self.meta_engine.generate_trade_signature_from_dict({
                     'direction': 'LONG',
                     'confluence': len(factors),
                     'market_regime': market_regime,
-                    'session': market_state['session'],
-                    'hour': datetime.now().hour
+                    'session': current_session,
+                    'hour': current_hour
                 }), pattern_check
             )
-            
-            if pattern_check and pattern_check['win_rate'] > 0.6:
-                pattern_score += 10
-                factors.append(f"Similar setups: {pattern_check['win_rate']:.1%} WR")
 
+            if similar and similar['win_rate'] > 0.6:
+                pattern_score += 20
+                factors.append(f"Similar setups: {similar['win_rate']:.1%} WR")
+
+            # Apply fixed weights
             weights = self.meta_engine.strategy_weights
             score = (
                 smc_score * weights['smc'] +
                 tech_score * weights['technical'] +
                 ml_score * weights['ml_ensemble'] +
                 pattern_score * weights['pattern_memory']
-            ) * (1 + len(factors) * 0.05)
+            ) * (1 + len(factors) * 0.05) * adx_penalty
 
             strategy_scores = {
                 'smc': smc_score,
                 'technical': tech_score,
                 'ml_ensemble': ml_score,
                 'pattern_memory': pattern_score,
-                'raw_total': score
+                'raw_total': score,
+                'adx_penalty': adx_penalty
             }
 
+            # Confidence must be 68-70%+
             if score >= config.min_confidence:
                 direction = "LONG"
 
@@ -1462,7 +1697,7 @@ class ScalpingEngine:
             tech_score = 0
             ml_score = 0
             pattern_score = 0
-            
+
             if 50 < rsi_5m < 80:
                 smc_score += 15
                 factors.append("RSI bounce in downtrend")
@@ -1490,15 +1725,29 @@ class ScalpingEngine:
                         break
 
             if model_preds['ensemble'] < 0.4:
-                ml_score += 15
+                ml_score += 30
                 factors.append(f"DL ensemble bearish ({model_preds['ensemble']:.2f})")
             elif model_preds['ensemble'] < 0.5:
-                ml_score += 8
+                ml_score += 15
                 factors.append(f"DL weak bearish ({model_preds['ensemble']:.2f})")
 
-            if bearish_count >= 4:
+            if bearish_count >= 3:
                 tech_score += 15
-                factors.append("Strong HTF alignment")
+                factors.append("Strong HTF alignment (3/4)")
+
+            similar = self.meta_engine.get_similar_trade_performance(
+                self.meta_engine.generate_trade_signature_from_dict({
+                    'direction': 'SHORT',
+                    'confluence': len(factors),
+                    'market_regime': market_regime,
+                    'session': current_session,
+                    'hour': current_hour
+                }), pattern_check
+            )
+
+            if similar and similar['win_rate'] > 0.6:
+                pattern_score += 20
+                factors.append(f"Similar setups: {similar['win_rate']:.1%} WR")
 
             weights = self.meta_engine.strategy_weights
             score = (
@@ -1506,14 +1755,15 @@ class ScalpingEngine:
                 tech_score * weights['technical'] +
                 ml_score * weights['ml_ensemble'] +
                 pattern_score * weights['pattern_memory']
-            ) * (1 + len(factors) * 0.05)
+            ) * (1 + len(factors) * 0.05) * adx_penalty
 
             strategy_scores = {
                 'smc': smc_score,
                 'technical': tech_score,
                 'ml_ensemble': ml_score,
                 'pattern_memory': pattern_score,
-                'raw_total': score
+                'raw_total': score,
+                'adx_penalty': adx_penalty
             }
 
             if score >= config.min_confidence:
@@ -1531,7 +1781,15 @@ class ScalpingEngine:
                 strategy_scores=strategy_scores
             )
 
+        # Entry and Risk Management
         entry = current_price
+        
+        # Adaptive position sizing by volatility and regime
+        risk_pct = config.risk_per_trade
+        if adx_entry < config.adx_filter_medium:
+            risk_pct *= 0.5  # Reduce size when ADX 18-22
+        
+        # ATR-based stop
         stop_distance = atr * config.atr_multiplier
 
         if direction == "LONG":
@@ -1559,55 +1817,60 @@ class ScalpingEngine:
             strategy_scores=strategy_scores
         )
 
+        # Trade signature and history check
         signal.trade_signature = self.meta_engine.generate_trade_signature(signal)
-        similar = self.db.get_trades_by_signature(signal.trade_signature)
-        if len(similar) > 5:
-            wins = sum(1 for t in similar if t['actual_result'] == 'SUCCESS')
-            signal.factors.append(f"History: {wins}/{len(similar)} similar wins")
+        similar_trades = self.db.get_trades_by_signature(signal.trade_signature)
+        if len(similar_trades) > 5:
+            wins = sum(1 for t in similar_trades if t['actual_result'] == 'SUCCESS')
+            signal.factors.append(f"History: {wins}/{len(similar_trades)} similar wins")
 
-        trade_id = self.db.save_trade(signal, market_state)
+        # Save with consecutive losses tracking
+        trade_id = self.db.save_trade(signal, market_state, consecutive_losses)
         signal.trade_id = trade_id
 
+        # Monitoring setup
         self.trade_monitoring[trade_id] = {
             'entry': entry,
             'stop_loss': stop_loss,
             'take_profit_1': take_profit_1,
             'take_profit_2': take_profit_2,
             'direction': direction,
-            'entry_time': datetime.now()
+            'entry_time': datetime.now(),
+            'risk_pct': risk_pct
         }
 
         return signal
-    
+
     async def check_retrain_needed(self):
+        """Check if daily retrain is needed (24 hours)"""
         hours_since_retrain = (datetime.now() - self.last_retrain).total_seconds() / 3600
-        
+
         if hours_since_retrain >= self.meta_engine.config.retrain_interval:
-            logger.info(f"Retrain interval reached: {hours_since_retrain:.1f} hours")
-            
+            logger.info(f"Daily retrain interval reached: {hours_since_retrain:.1f} hours")
+
             trade_history = self.db.get_training_data(limit=5000)
-            
-            if len(trade_history) >= 10:
+
+            if len(trade_history) >= 100:  # Retrain after 100+ new trades or daily
                 success = self.dl_model.retrain(trade_history, self.meta_engine)
-                
+
                 self.meta_engine.update_strategy_weights(trade_history)
-                
+
                 new_features = self.meta_engine.discover_new_features(None, trade_history)
                 if new_features:
                     logger.info(f"Discovered important features: {new_features}")
-                
-                self.db.log_meta_adaptation(self.meta_engine, "scheduled_retrain")
+
+                self.db.log_meta_adaptation(self.meta_engine, "daily_retrain")
                 self.meta_engine.save_state()
-                
+
                 if success:
                     self.last_retrain = datetime.now()
-                    logger.info("Retraining completed successfully")
+                    logger.info("Daily retraining completed successfully")
                     return True
             else:
                 logger.info(f"Insufficient trades for retrain: {len(trade_history)}")
-        
+
         return False
-    
+
     def monitor_open_trades(self, current_price):
         for trade_id, trade_info in list(self.trade_monitoring.items()):
             direction = trade_info['direction']
@@ -1615,11 +1878,11 @@ class ScalpingEngine:
             sl = trade_info['stop_loss']
             tp1 = trade_info['take_profit_1']
             tp2 = trade_info['take_profit_2']
-            
+
             result = None
             pnl = 0
             exit_price = current_price
-            
+
             if direction == "LONG":
                 if current_price <= sl:
                     result = "STOP_LOSS"
@@ -1640,7 +1903,7 @@ class ScalpingEngine:
                     exit_price = tp2
                 elif current_price <= tp1:
                     continue
-            
+
             if result:
                 self.db.update_trade_result(trade_id, result, pnl, exit_price)
                 del self.trade_monitoring[trade_id]
@@ -1668,14 +1931,16 @@ class XAUUSDBot:
         ]
 
         await update.message.reply_text(
-            "🏆 *XAUUSD Self-Learning AI Scalper v2.0*\n\n"
+            "🏆 *XAUUSD Self-Learning AI Scalper v3.0*\n\n"
             "🧠 Features:\n"
-            "• Adaptive Strategy Weights\n"
-            "• Market Regime Detection\n"
-            "• Auto Feature Discovery\n"
-            "• Kelly Criterion Sizing\n"
-            "• Uncertainty Quantification\n"
-            "• Pattern Memory\n\n"
+            "• Fixed Strategy Weights (SMC 35%, ML 30%)\n"
+            "• 4 Market Regimes with Persistence\n"
+            "• 0.75-1% Risk per Trade\n"
+            "• 68-70% Confidence Threshold\n"
+            "• 3/4 Timeframe Alignment Required\n"
+            "• ADX 22 Filter (18-22 Reduced Size)\n"
+            "• Max 3 Consecutive Losses\n"
+            "• Daily Model Retraining\n\n"
             "The AI evolves with every trade!",
             reply_markup=InlineKeyboardMarkup(keyboard),
             parse_mode="Markdown"
@@ -1714,6 +1979,14 @@ class XAUUSDBot:
                     logger.error(f"Error fetching {tf_name}: {e}")
 
                 await asyncio.sleep(0.5)
+
+            # Fetch 1H for regime detection
+            try:
+                df_1h = await client.get_ohlcv("XAU/USD", "1h", 100)
+                if df_1h is not None:
+                    data["1h"] = self.engine.tech.calculate_indicators(df_1h)
+            except Exception as e:
+                logger.error(f"Error fetching 1h: {e}")
 
             if current_price is None:
                 try:
@@ -1755,10 +2028,14 @@ class XAUUSDBot:
 
         await query.edit_message_text(
             "🔔 *ADAPTIVE STREAM STARTED*\n\n"
-            "AI is learning and evolving...\n"
-            "Strategy weights auto-adjust every 10 trades\n"
-            "Models retrain hourly with new data\n"
-            "Risk sizing adapts to market regime",
+            "AI Configuration:\n"
+            "• Strategy Weights: Fixed (SMC 35%, ML 30%)\n"
+            "• Risk: 0.75-1% per trade\n"
+            "• Confidence: 68-70% minimum\n"
+            "• Timeframes: 1M/5M/15M/30M (need 3/4)\n"
+            "• ADX Filter: 22 (18-22 reduced size)\n"
+            "• Retrain: Daily\n"
+            "• Max Losses: 3 consecutive",
             parse_mode="Markdown"
         )
 
@@ -1767,7 +2044,7 @@ class XAUUSDBot:
 
     async def stop_stream(self, query, context: ContextTypes.DEFAULT_TYPE):
         self.monitoring = False
-        
+
         if self.retrain_task:
             self.retrain_task.cancel()
 
@@ -1782,9 +2059,10 @@ class XAUUSDBot:
         )
 
     async def retrain_loop(self):
+        """Daily retrain loop (24 hours)"""
         while self.monitoring:
             try:
-                await asyncio.sleep(3600)
+                await asyncio.sleep(86400)  # 24 hours
                 if self.monitoring:
                     await self.engine.check_retrain_needed()
             except asyncio.CancelledError:
@@ -1810,6 +2088,7 @@ class XAUUSDBot:
 
                 now = time.time()
 
+                # Send high confidence signals immediately
                 if signal.status == "VALID" and signal.confidence >= 80:
                     if self.chat_id:
                         await context.bot.send_message(
@@ -1819,6 +2098,7 @@ class XAUUSDBot:
                         )
                     last_message_time = now
 
+                # Status update every 5 minutes
                 elif now - last_message_time > 300:
                     if self.chat_id:
                         await context.bot.send_message(
@@ -1835,62 +2115,69 @@ class XAUUSDBot:
             except Exception as e:
                 logger.error(f"Stream error: {e}")
                 await asyncio.sleep(60)
-    
+
     async def show_stats(self, query):
         history = self.engine.db.get_training_data(limit=100)
-        
+
         if not history:
             await query.edit_message_text("No trade history yet.")
             return
-        
+
         total = len(history)
         wins = sum(1 for t in history if t['actual_result'] == 'SUCCESS')
         win_rate = wins / total if total > 0 else 0
-        
+
         avg_profit = np.mean([t['profit_loss'] for t in history if t['profit_loss']]) if history else 0
         
+        # Calculate consecutive losses
+        consecutive_losses = self.engine.db.get_consecutive_losses()
+
         returns = [t['profit_loss'] for t in history if t['profit_loss'] is not None]
         sharpe = np.mean(returns) / np.std(returns) if len(returns) > 1 and np.std(returns) > 0 else 0
-        
+
         text = (
             f"📊 *AI PERFORMANCE STATS*\n\n"
             f"Total Trades: {total}\n"
             f"Win Rate: {win_rate:.1%}\n"
             f"Avg PnL: {avg_profit:.2f}%\n"
             f"Risk-Adj Return: {sharpe:.2f}\n"
+            f"Consecutive Losses: {consecutive_losses}/3\n"
             f"Last Retrain: {(datetime.now() - self.engine.last_retrain).total_seconds()/3600:.1f}h ago\n\n"
             f"Success Patterns: {len(self.engine.db.success_patterns)}\n"
             f"Failure Patterns: {len(self.engine.db.failure_patterns)}"
         )
-        
+
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Back", callback_data="stop")]])
         )
-    
+
     async def show_meta_status(self, query):
         meta = self.engine.meta_engine
-        
+
         text = (
             f"🧠 *META-LEARNING STATUS*\n\n"
-            f"*Strategy Weights:*\n"
-            f"  SMC: {meta.strategy_weights['smc']:.2%}\n"
-            f"  Technical: {meta.strategy_weights['technical']:.2%}\n"
-            f"  ML Ensemble: {meta.strategy_weights['ml_ensemble']:.2%}\n"
-            f"  Pattern Memory: {meta.strategy_weights['pattern_memory']:.2%}\n\n"
+            f"*Fixed Strategy Weights:*\n"
+            f"  SMC: 35.0%\n"
+            f"  ML Ensemble: 30.0%\n"
+            f"  Pattern Memory: 20.0%\n"
+            f"  Technical: 15.0%\n\n"
             f"*Adaptive Config:*\n"
             f"  Min Confidence: {meta.config.min_confidence:.1f}%\n"
             f"  Min ADX: {meta.config.min_adx:.1f}\n"
-            f"  Risk/Trade: {meta.config.risk_per_trade:.2%}\n\n"
-            f"*Market Regimes Learned:*\n"
+            f"  Risk/Trade: {meta.config.risk_per_trade:.2%}\n"
+            f"  Max Risk: {meta.config.max_risk:.2%}\n"
+            f"  Weight Freeze: {meta.total_trades_since_weight_update}/{meta.config.weight_freeze_trades} trades\n\n"
+            f"*Market Regimes:*\n"
         )
-        
+
         for regime, stats in meta.market_regime_stats.items():
-            text += f"  {regime}: {stats.get('win_rate', 0):.1%} WR\n"
-        
-        text += f"\nAnalyses: {self.engine.analysis_count}"
-        
+            text += f"  {regime}: {stats.get('win_rate', 0):.1%} WR (candles: {stats.get('candle_count', 0)})\n"
+
+        text += f"\nCurrent Regime: {meta.current_regime}\n"
+        text += f"Analyses: {self.engine.analysis_count}"
+
         await query.edit_message_text(
             text,
             parse_mode="Markdown",
@@ -1909,7 +2196,7 @@ class XAUUSDBot:
                 f"Confluence: {signal.confluence_count}/10\n"
                 f"DL Confidence: {signal.model_predictions.get('confidence', 0):.2f}\n\n"
                 f"Reason: {signal.invalid_reason or 'No setup'}\n\n"
-                f"*Timeframe Alignment:*\n"
+                f"*Timeframe Alignment (need 3/4):*\n"
             )
 
             for tf, align in signal.timeframe_alignment.items():
@@ -1922,33 +2209,33 @@ class XAUUSDBot:
         alarm_emoji = "🚨 " if is_alarm else ""
 
         strat_scores = signal.strategy_scores or {}
-        
+
         text = (
             f"{alarm_emoji}{emoji} *{signal.direction} SIGNAL* {emoji}{alarm_emoji}\n\n"
             f"Confidence: *{signal.confidence:.1f}%* 🎯\n"
             f"Confluence: {signal.confluence_count} factors\n"
             f"DL Ensemble: {signal.model_predictions.get('ensemble', 0.5):.2f}\n"
-            f"Uncertainty: {signal.model_predictions.get('uncertainty', 0.5):.2f}\n\n"
+            f"Uncertainty: {signal.model_predictions.get('uncertainty', 0.5):.2f}\n"
+            f"ADX Penalty: {strat_scores.get('adx_penalty', 1.0):.2f}\n\n"
             f"📍 Entry: `{signal.entry}`\n"
             f"🛑 SL: `{signal.stop_loss}`\n"
             f"🎯 TP1: `{signal.take_profit_1}`\n"
             f"🎯 TP2: `{signal.take_profit_2}`\n\n"
             f"*Strategy Breakdown:*\n"
-            f"SMC: {strat_scores.get('smc', 0):.0f}\n"
-            f"Tech: {strat_scores.get('technical', 0):.0f}\n"
-            f"ML: {strat_scores.get('ml_ensemble', 0):.0f}\n"
-            f"Pattern: {strat_scores.get('pattern_memory', 0):.0f}\n\n"
+            f"SMC (35%): {strat_scores.get('smc', 0):.0f}\n"
+            f"ML (30%): {strat_scores.get('ml_ensemble', 0):.0f}\n"
+            f"Pattern (20%): {strat_scores.get('pattern_memory', 0):.0f}\n"
+            f"Tech (15%): {strat_scores.get('technical', 0):.0f}\n\n"
             f"*Factors:*\n"
         )
 
         for i, factor in enumerate(signal.factors[:6], 1):
             text += f"{i}. {factor}\n"
 
-        text += f"\n*Alignment:*\n"
-        for tf in ["1m", "5m", "15m", "30m", "1h"]:
-            align = signal.timeframe_alignment.get(tf, "NEUTRAL")
-            em = "🟢" if align == "BULLISH" else "🔴" if align == "BEARISH" else "⚪"
-            text += f"{em}"
+        text += f"\n*Alignment (4TF):*\n"
+        bullish_count = sum(1 for v in signal.timeframe_alignment.values() if v == "BULLISH")
+        bearish_count = sum(1 for v in signal.timeframe_alignment.values() if v == "BEARISH")
+        text += f"🟢 {bullish_count} | 🔴 {bearish_count} (Need 3)\n"
 
         return text
 
